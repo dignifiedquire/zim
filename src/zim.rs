@@ -82,7 +82,6 @@ impl Zim {
         let master_view = unsafe { Mmap::map(&f)? };
 
         let (header, mime_table) = parse_header(&master_view)?;
-        dbg!(&header);
         let url_list = parse_url_list(&master_view, header.url_ptr_pos, header.article_count)?;
         let article_list = if let Some(title_ptr_pos) = header.title_ptr_pos {
             let list = parse_article_list(&master_view, title_ptr_pos, header.article_count)?;
