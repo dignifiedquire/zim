@@ -105,6 +105,23 @@ impl<'a> Cluster<'a> {
         self.0.read().unwrap().compression
     }
 
+    /// Returns a copy of the blob's bytes.
+    ///
+    /// Unlike [`Cluster::get_blob`], the result does not borrow from the cluster, so this can be
+    /// used with a `Cluster` that is dropped straight away.
+    pub fn blob_to_vec(&self, idx: u32) -> Result<Vec<u8>> {
+        {
+            let lock = self.0.read().unwrap();
+            if lock.needs_decompression() {
+                drop(lock);
+                self.0.write().unwrap().decompress()?;
+            }
+        }
+
+        let guard = self.0.read().unwrap();
+        Ok(guard.get_blob(idx)?.to_vec())
+    }
+
     pub fn get_blob<'b: 'a>(&'b self, idx: u32) -> Result<Blob<'a, 'b>> {
         {
             let lock = self.0.read().unwrap();

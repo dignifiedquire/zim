@@ -14,6 +14,7 @@ use crate::directory_iterator::DirectoryIterator;
 use crate::errors::{Error, Result};
 use crate::mime_type::MimeType;
 use crate::namespace::Namespace;
+use crate::target::Target;
 use crate::uuid::Uuid;
 
 /// Magic number to recognise the file format, must be 72173914
@@ -24,6 +25,21 @@ pub const ZIM_MAGIC_NUMBER: u32 = 72173914;
 /// The MIME type list directly follows the header, so `mimeListPos` also defines the header's
 /// size and is never smaller than this.
 const HEADER_SIZE: u64 = 80;
+
+/// Path of the well known main page entry, in the `W` namespace.
+const MAIN_PAGE: &str = "mainPage";
+
+/// Every entry ordered by title. Removed from the format in version 6.3.
+const LISTING_TITLE_ORDERED_V0: &str = "listing/titleOrdered/v0";
+
+/// Article entries ordered by title. Added in version 6.1.
+const LISTING_TITLE_ORDERED_V1: &str = "listing/titleOrdered/v1";
+
+const XAPIAN_FULLTEXT: &str = "fulltext/xapian";
+const XAPIAN_TITLE: &str = "title/xapian";
+
+/// A redirect may point at another redirect, but a chain this long is a loop.
+const MAX_REDIRECT_HOPS: usize = 50;
 
 /// Represents a ZIM file
 #[allow(dead_code)]
@@ -220,6 +236,20 @@ impl Zim {
     /// Note that in the new namespace scheme (format version 6.1 and later) the stored path does
     /// not include the namespace, which is why it is passed separately.
     pub fn find_by_path(&self, namespace: Namespace, path: &str) -> Result<Option<u32>> {
+        let idx = self.lower_bound(namespace, path)?;
+
+        if (idx as usize) < self.url_list.len() {
+            let entry = self.get_by_url_index(idx)?;
+            if entry.namespace == namespace && entry.url == path {
+                return Ok(Some(idx));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Index of the first entry that is not ordered before `namespace`/`path`.
+    fn lower_bound(&self, namespace: Namespace, path: &str) -> Result<u32> {
         let target = (namespace.as_byte(), path.as_bytes());
 
         let mut low = 0usize;
@@ -231,18 +261,152 @@ impl Zim {
 
             match (entry.namespace.as_byte(), entry.url.as_bytes()).cmp(&target) {
                 Ordering::Less => low = mid + 1,
-                Ordering::Greater => high = mid,
-                Ordering::Equal => return Ok(Some(mid as u32)),
+                _ => high = mid,
             }
         }
 
-        Ok(None)
+        Ok(low as u32)
     }
 
     /// Returns the entry at `namespace`/`path`, if it exists.
     pub fn get_by_path(&self, namespace: Namespace, path: &str) -> Result<Option<DirectoryEntry>> {
         match self.find_by_path(namespace, path)? {
             Some(idx) => Ok(Some(self.get_by_url_index(idx)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Returns the paths of every entry in `namespace`, in order.
+    pub fn paths_in_namespace(&self, namespace: Namespace) -> Result<Vec<String>> {
+        let start = self.lower_bound(namespace, "")?;
+
+        let mut out = Vec::new();
+        for idx in start..self.url_list.len() as u32 {
+            let entry = self.get_by_url_index(idx)?;
+            if entry.namespace != namespace {
+                break;
+            }
+            out.push(entry.url);
+        }
+
+        Ok(out)
+    }
+
+    /// Returns the contents of an entry, or `None` if it does not store any (a redirect, or one
+    /// of the deprecated linktarget/deleted entries).
+    pub fn entry_data(&self, entry: &DirectoryEntry) -> Result<Option<Vec<u8>>> {
+        match entry.target {
+            Some(Target::Cluster(cluster_idx, blob_idx)) => {
+                let cluster = self.get_cluster(cluster_idx)?;
+                Ok(Some(cluster.blob_to_vec(blob_idx)?))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Follows redirects until reaching an entry that stores content.
+    ///
+    /// A redirect may legally point at another redirect, so the chain is followed rather than
+    /// resolved in a single hop.
+    pub fn resolve(&self, entry: DirectoryEntry) -> Result<DirectoryEntry> {
+        let mut entry = entry;
+
+        for _ in 0..MAX_REDIRECT_HOPS {
+            match entry.target {
+                Some(Target::Redirect(idx)) => entry = self.get_by_url_index(idx)?,
+                _ => return Ok(entry),
+            }
+        }
+
+        Err(Error::RedirectLoop)
+    }
+
+    /// Returns the archive's main page, with the redirect followed.
+    ///
+    /// Prefers the well known `W/mainPage` entry, falling back to the header's index - well known
+    /// entries are optional, so a reader must cope with it being absent.
+    pub fn main_page(&self) -> Result<Option<DirectoryEntry>> {
+        let entry = match self.get_by_path(Namespace::CategoriesArticle, MAIN_PAGE)? {
+            Some(entry) => Some(entry),
+            None => match self.header.main_page {
+                Some(idx) => Some(self.get_by_url_index(idx)?),
+                None => None,
+            },
+        };
+
+        match entry {
+            Some(entry) => Ok(Some(self.resolve(entry)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Returns the contents of the named metadata entry, e.g. `Title` or `Language`.
+    pub fn metadata(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        match self.get_by_path(Namespace::Metadata, name)? {
+            Some(entry) => self.entry_data(&entry),
+            None => Ok(None),
+        }
+    }
+
+    /// Returns the names of every metadata entry present.
+    pub fn metadata_keys(&self) -> Result<Vec<String>> {
+        self.paths_in_namespace(Namespace::Metadata)
+    }
+
+    /// Returns every entry ordered by title, as indices into the path pointer list.
+    ///
+    /// Prefers the `X/listing/titleOrdered/v0` entry and falls back to the deprecated title
+    /// pointer list, as the spec directs. Format version 6.3 removed both, carrying only the
+    /// article listing, so this returns `None` for such archives - use
+    /// [`Zim::article_list_by_title`] instead.
+    pub fn entry_list_by_title(&self) -> Result<Option<Vec<u32>>> {
+        if let Some(listing) = self.listing(LISTING_TITLE_ORDERED_V0)? {
+            return Ok(Some(listing));
+        }
+
+        Ok(self.article_list.clone())
+    }
+
+    /// Returns the archive's article entries ordered by title, as indices into the path pointer
+    /// list.
+    ///
+    /// This is the `X/listing/titleOrdered/v1` entry added in format version 6.1. Unlike
+    /// [`Zim::entry_list_by_title`] it covers only article entries, so it is what you want in
+    /// order to list or sample articles without resources mixed in.
+    pub fn article_list_by_title(&self) -> Result<Option<Vec<u32>>> {
+        self.listing(LISTING_TITLE_ORDERED_V1)
+    }
+
+    /// Returns the raw Xapian fulltext index, to be opened with a Xapian implementation.
+    pub fn fulltext_index(&self) -> Result<Option<Vec<u8>>> {
+        self.index_entry(XAPIAN_FULLTEXT)
+    }
+
+    /// Returns the raw Xapian title index, to be opened with a Xapian implementation.
+    pub fn title_index(&self) -> Result<Option<Vec<u8>>> {
+        self.index_entry(XAPIAN_TITLE)
+    }
+
+    /// Reads a listing entry from the `X` namespace as a list of entry indices.
+    fn listing(&self, path: &str) -> Result<Option<Vec<u32>>> {
+        let Some(data) = self.index_entry(path)? else {
+            return Ok(None);
+        };
+
+        if data.len() % 4 != 0 {
+            return Err(Error::InvalidListing);
+        }
+
+        Ok(Some(
+            data.chunks_exact(4)
+                .map(|raw| u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
+                .collect(),
+        ))
+    }
+
+    fn index_entry(&self, path: &str) -> Result<Option<Vec<u8>>> {
+        match self.get_by_path(Namespace::FulltextIndex, path)? {
+            Some(entry) => self.entry_data(&entry),
             None => Ok(None),
         }
     }
@@ -521,6 +685,107 @@ mod tests {
 
         let entries = zim.iterate_by_urls().collect::<Result<Vec<_>>>().unwrap();
         assert_eq!(entries.len(), 19);
+    }
+
+    #[test]
+    fn resolves_the_main_page_through_its_redirect() {
+        // The header's main page index points at `W/mainPage`, which is a redirect into `C`.
+        // Reporting that stub instead of following it yields the useless path "mainPage".
+        for (fixture, expected) in [
+            ("fixtures/speedtest_en_blob-mini_2024-05.zim", "home.html"),
+            ("fixtures/wikipedia_en_100_2026-04.zim", "index"),
+        ] {
+            let zim = Zim::new(fixture).expect("failed to parse fixture");
+            let main = zim
+                .main_page()
+                .unwrap()
+                .expect("fixture should have a main page");
+
+            assert_eq!(main.url, expected, "{fixture}");
+            assert_eq!(main.namespace, Namespace::UserContent, "{fixture}");
+        }
+    }
+
+    #[test]
+    fn reads_metadata() {
+        let zim =
+            Zim::new("fixtures/wikipedia_en_100_2026-04.zim").expect("failed to parse fixture");
+
+        let title = zim.metadata("Title").unwrap().expect("Title is mandatory");
+        assert_eq!(String::from_utf8(title).unwrap(), "Wikipedia 100");
+
+        assert!(zim.metadata("NoSuchMetadataEntry").unwrap().is_none());
+
+        let keys = zim.metadata_keys().unwrap();
+        for expected in [
+            "Title",
+            "Language",
+            "Creator",
+            "Date",
+            "Illustration_48x48@1",
+        ] {
+            assert!(keys.contains(&expected.to_string()), "missing {expected}");
+        }
+        // Namespace scanning must stop at the namespace boundary rather than run to the end.
+        assert!(keys.len() < zim.header.article_count as usize);
+    }
+
+    #[test]
+    fn exposes_xapian_indexes() {
+        let zim =
+            Zim::new("fixtures/wikipedia_en_100_2026-04.zim").expect("failed to parse fixture");
+
+        assert!(!zim
+            .fulltext_index()
+            .unwrap()
+            .expect("fulltext index")
+            .is_empty());
+        assert!(!zim.title_index().unwrap().expect("title index").is_empty());
+    }
+
+    /// Version 6.3 removed both the header's title pointer list and the `v0` listing, leaving
+    /// only the article listing. Title ordering must still be reachable for such archives.
+    #[test]
+    fn title_listings_track_the_format_version() {
+        let v62 = Zim::new("fixtures/speedtest_en_blob-mini_2024-05.zim")
+            .expect("failed to parse fixture");
+        assert_eq!((v62.header.version_major, v62.header.version_minor), (6, 2));
+        assert!(v62.header.title_ptr_pos.is_some());
+        assert!(v62.entry_list_by_title().unwrap().is_some());
+        assert!(v62.article_list_by_title().unwrap().is_some());
+
+        let v63 =
+            Zim::new("fixtures/wikipedia_en_100_2026-04.zim").expect("failed to parse fixture");
+        assert_eq!((v63.header.version_major, v63.header.version_minor), (6, 3));
+        assert!(v63.header.title_ptr_pos.is_none());
+        assert!(v63.entry_list_by_title().unwrap().is_none());
+
+        let articles = v63
+            .article_list_by_title()
+            .unwrap()
+            .expect("6.3 archives carry the v1 listing");
+        assert!(!articles.is_empty());
+        assert!(articles.len() < v63.header.article_count as usize);
+
+        // The listing must decode to real indices, in title order - a wrong element width or
+        // endianness would still produce a plausible-looking list of numbers.
+        let titles: Vec<String> = articles
+            .iter()
+            .map(|&idx| {
+                let entry = v63
+                    .get_by_url_index(idx)
+                    .expect("listing index must be valid");
+                if entry.title.is_empty() {
+                    entry.url
+                } else {
+                    entry.title
+                }
+            })
+            .collect();
+        assert!(
+            titles.windows(2).all(|pair| pair[0] <= pair[1]),
+            "v1 listing is not in title order"
+        );
     }
 
     /// `find_by_path` is a binary search, which is only sound because the format guarantees that

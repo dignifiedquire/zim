@@ -14,6 +14,10 @@ pub enum Error {
     InvalidBlobList,
     #[error("unterminated string in directory entry")]
     UnterminatedString,
+    #[error("redirect chain did not terminate")]
+    RedirectLoop,
+    #[error("listing entry has a malformed length")]
+    InvalidListing,
     #[error("unknown mimetype")]
     UnknownMimeType,
     #[error("invalid magic number")]

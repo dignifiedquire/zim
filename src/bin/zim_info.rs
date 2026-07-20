@@ -75,15 +75,54 @@ fn main() -> Result<()> {
     }
     println!("Compressions: {:?}", compressions);
 
-    let (main_page, main_page_idx) = if let Some(main_page_idx) = zim_file.header.main_page {
-        let page = zim_file.get_by_url_index(main_page_idx)?;
-
-        (page.url, main_page_idx as isize)
-    } else {
-        ("-".into(), -1)
+    let main_page = match zim_file.main_page()? {
+        Some(page) => page.url,
+        None => "-".into(),
     };
+    println!("Main page: \"{}\"", main_page);
 
-    println!("Main page: \"{}\" (index: {})", main_page, main_page_idx);
+    println!(
+        "Title listing: {}",
+        match (
+            zim_file.entry_list_by_title()?,
+            zim_file.article_list_by_title()?,
+        ) {
+            (Some(entries), Some(articles)) => format!(
+                "{} entries (v0), {} articles (v1)",
+                entries.len(),
+                articles.len()
+            ),
+            (Some(entries), None) => format!("{} entries (v0)", entries.len()),
+            (None, Some(articles)) => format!("{} articles (v1)", articles.len()),
+            (None, None) => "-".into(),
+        }
+    );
+
+    println!(
+        "Search indexes: fulltext {}, title {}",
+        if zim_file.fulltext_index()?.is_some() {
+            "yes"
+        } else {
+            "no"
+        },
+        if zim_file.title_index()?.is_some() {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+
+    println!("\nMetadata:");
+    for key in zim_file.metadata_keys()? {
+        match zim_file.metadata(&key)? {
+            // Metadata is text apart from the illustrations, so only print what renders.
+            Some(value) => match String::from_utf8(value) {
+                Ok(text) => println!("  {}: {}", key, text),
+                Err(err) => println!("  {}: <{} bytes>", key, err.as_bytes().len()),
+            },
+            None => println!("  {}: -", key),
+        }
+    }
 
     let (layout_page, layout_page_idx) = if let Some(layout_page_idx) = zim_file.header.layout_page
     {
