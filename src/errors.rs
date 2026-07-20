@@ -20,8 +20,8 @@ pub enum Error {
     InvalidMagicNumber,
     #[error("invalid major version: {0}, must be 5 or 6")]
     InvalidVersion(u16),
-    #[error("invalid header")]
-    InvalidHeader,
+    #[error("invalid header: {0}")]
+    InvalidHeader(&'static str),
     #[error("cluster extension requires major version 6")]
     InvalidClusterExtension,
     #[error("cluster is missing a blob list")]

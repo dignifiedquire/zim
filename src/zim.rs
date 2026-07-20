@@ -17,6 +17,12 @@ use crate::uuid::Uuid;
 /// Magic number to recognise the file format, must be 72173914
 pub const ZIM_MAGIC_NUMBER: u32 = 72173914;
 
+/// Size of the header, up to and including `checksumPos`.
+///
+/// The MIME type list directly follows the header, so `mimeListPos` also defines the header's
+/// size and is never smaller than this.
+const HEADER_SIZE: u64 = 80;
+
 /// Represents a ZIM file
 #[allow(dead_code)]
 pub struct Zim {
@@ -68,8 +74,55 @@ pub struct ZimHeader {
     /// pointer to the md5checksum of this file without the checksum itself.
     /// This points always 16 bytes before the end of the file.
     pub checksum_pos: u64,
-    /// pointer to the geo index (optional). Present if mimeListPos is at least 80.
-    pub geo_index_pos: Option<u64>,
+}
+
+impl ZimHeader {
+    /// Rejects headers whose offsets cannot describe a readable archive.
+    ///
+    /// Mirrors libzim's own header validation. Without it, contradictory offsets are only
+    /// discovered much later, as an out-of-bounds read against an unrelated structure.
+    fn sanity_check(&self, file_len: u64) -> Result<()> {
+        if self.mime_list_pos < HEADER_SIZE {
+            return Err(Error::InvalidHeader("mimeListPos overlaps the header"));
+        }
+        if self.mime_list_pos > file_len {
+            return Err(Error::InvalidHeader("mimeListPos is past the end of file"));
+        }
+
+        // Every other structure is stored after the MIME type list.
+        for (pos, what) in [
+            (self.url_ptr_pos, "pathPtrPos precedes mimeListPos"),
+            (
+                self.title_ptr_pos.unwrap_or(u64::MAX),
+                "titlePtrPos precedes mimeListPos",
+            ),
+            (self.cluster_ptr_pos, "clusterPtrPos precedes mimeListPos"),
+            (self.checksum_pos, "checksumPos precedes mimeListPos"),
+        ] {
+            if pos < self.mime_list_pos {
+                return Err(Error::InvalidHeader(what));
+            }
+        }
+
+        // The checksum is always the final 16 bytes; the last cluster's extent is derived from
+        // this, so a wrong value silently mis-sizes it.
+        if self.checksum_pos.checked_add(16) != Some(file_len) {
+            return Err(Error::InvalidHeader(
+                "checksumPos is not 16 bytes before the end of file",
+            ));
+        }
+
+        if (self.article_count == 0) != (self.cluster_count == 0) {
+            return Err(Error::InvalidHeader(
+                "entryCount and clusterCount disagree about being empty",
+            ));
+        }
+        if self.cluster_count > self.article_count {
+            return Err(Error::InvalidHeader("clusterCount exceeds entryCount"));
+        }
+
+        Ok(())
+    }
 }
 
 impl Zim {
@@ -179,6 +232,11 @@ fn is_defined(val: u32) -> Option<u32> {
 }
 
 fn parse_header(master_view: &Mmap) -> Result<(ZimHeader, Vec<String>)> {
+    let file_len = master_view.len() as u64;
+    if file_len < HEADER_SIZE {
+        return Err(Error::InvalidHeader("file is smaller than the header"));
+    }
+
     let mut header_cur = Cursor::new(master_view);
 
     let magic = header_cur.read_u32::<LittleEndian>()?;
@@ -218,18 +276,29 @@ fn parse_header(master_view: &Mmap) -> Result<(ZimHeader, Vec<String>)> {
     let layout_page = header_cur.read_u32::<LittleEndian>()?;
     let checksum_pos = header_cur.read_u64::<LittleEndian>()?;
 
-    if header_cur.position() != 80 {
-        return Err(Error::InvalidHeader);
-    }
+    debug_assert_eq!(header_cur.position(), HEADER_SIZE);
 
-    let geo_index_pos = if mime_list_pos > 80 {
-        Some(header_cur.read_u64::<LittleEndian>()?)
-    } else {
-        None
+    let header = ZimHeader {
+        version_major,
+        version_minor,
+        uuid: Uuid::new(uuid),
+        article_count,
+        cluster_count,
+        url_ptr_pos,
+        title_ptr_pos,
+        cluster_ptr_pos,
+        mime_list_pos,
+        main_page: is_defined(main_page),
+        layout_page: is_defined(layout_page),
+        checksum_pos,
     };
+    header.sanity_check(file_len)?;
 
-    // the mime table is always directly after the 80-byte header, so we'll keep
-    // using our header cursor
+    // The MIME type list directly follows the header, so seek to `mime_list_pos` rather than
+    // assuming the length of the fields read above. A header extended by a future minor version
+    // is then skipped instead of being parsed as MIME types.
+    header_cur.set_position(mime_list_pos);
+
     let mime_table = {
         let mut mime_table = Vec::new();
         loop {
@@ -245,24 +314,7 @@ fn parse_header(master_view: &Mmap) -> Result<(ZimHeader, Vec<String>)> {
         mime_table
     };
 
-    Ok((
-        ZimHeader {
-            version_major,
-            version_minor,
-            uuid: Uuid::new(uuid),
-            article_count,
-            cluster_count,
-            url_ptr_pos,
-            title_ptr_pos,
-            cluster_ptr_pos,
-            mime_list_pos,
-            main_page: is_defined(main_page),
-            layout_page: is_defined(layout_page),
-            checksum_pos,
-            geo_index_pos,
-        },
-        mime_table,
-    ))
+    Ok((header, mime_table))
 }
 
 /// Returns the `count * width` byte region a pointer list occupies.
@@ -431,6 +483,61 @@ mod tests {
 
         let entries = zim.iterate_by_urls().collect::<Result<Vec<_>>>().unwrap();
         assert_eq!(entries.len(), 19);
+    }
+
+    /// Contradictory header offsets must be caught when the archive is opened. Otherwise they
+    /// surface much later as an out-of-bounds read against an unrelated structure, or - for the
+    /// last cluster, whose extent is derived from `checksumPos` - as silently wrong data.
+    #[test]
+    fn corrupt_headers_are_rejected_on_open() {
+        let original = std::fs::read("fixtures/speedtest_en_blob-mini_2024-05.zim")
+            .expect("failed to read fixture");
+        let file_len = original.len() as u64;
+
+        let cases: [(usize, Vec<u8>, &str); 5] = [
+            (
+                32,
+                8u64.to_le_bytes().into(),
+                "pathPtrPos inside the header",
+            ),
+            (
+                48,
+                40u64.to_le_bytes().into(),
+                "clusterPtrPos inside the header",
+            ),
+            (
+                56,
+                8u64.to_le_bytes().into(),
+                "mimeListPos inside the header",
+            ),
+            (
+                72,
+                file_len.to_le_bytes().into(),
+                "checksumPos not 16 bytes from the end",
+            ),
+            (
+                28,
+                u32::MAX.to_le_bytes().into(),
+                "clusterCount exceeding entryCount",
+            ),
+        ];
+
+        for (offset, value, what) in cases {
+            let mut corrupt = original.clone();
+            corrupt[offset..offset + value.len()].copy_from_slice(&value);
+
+            let path = std::env::temp_dir().join(format!("zim-corrupt-header-{offset}.zim"));
+            std::fs::write(&path, &corrupt).expect("failed to write temp archive");
+
+            let result = Zim::new(&path);
+            std::fs::remove_file(&path).ok();
+
+            match result {
+                Err(Error::InvalidHeader(_)) => {}
+                Err(other) => panic!("{what}: expected InvalidHeader, got {other:?}"),
+                Ok(_) => panic!("{what}: expected the archive to be rejected"),
+            }
+        }
     }
 
     /// Indices reaching the public accessors come from the archive itself - redirect targets,
