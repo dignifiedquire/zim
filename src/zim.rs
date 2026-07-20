@@ -147,8 +147,11 @@ impl Zim {
     ///
     /// idx must be between 0 and `article_count`
     pub fn get_by_url_index(&self, idx: u32) -> Result<DirectoryEntry> {
-        let entry_offset = self.url_list[idx as usize] as usize;
-        let (_, dir_view) = self.master_view.split_at(entry_offset);
+        let entry_offset = *self.url_list.get(idx as usize).ok_or(Error::OutOfBounds)?;
+        let dir_view = self
+            .master_view
+            .get(usize::try_from(entry_offset)?..)
+            .ok_or(Error::OutOfBounds)?;
 
         DirectoryEntry::new(self, dir_view)
     }
@@ -262,13 +265,24 @@ fn parse_header(master_view: &Mmap) -> Result<(ZimHeader, Vec<String>)> {
     ))
 }
 
-/// Parses the URL Pointer List.
-/// See https://wiki.openzim.org/wiki/ZIM_file_format#URL_Pointer_List_.28urlPtrPos.29
-fn parse_url_list(master_view: &Mmap, ptr_pos: u64, count: u32) -> Result<Vec<u64>> {
+/// Returns the `count * width` byte region a pointer list occupies.
+///
+/// `ptr_pos` and `count` come straight from the header, so the extent is computed with checked
+/// arithmetic - otherwise a large value wraps and the bounds check below passes vacuously.
+fn pointer_list_view(master_view: &Mmap, ptr_pos: u64, count: u32, width: usize) -> Result<&[u8]> {
     let start = usize::try_from(ptr_pos)?;
-    let end = start + usize::try_from(count)? * 8;
-    let list_view = master_view.get(start..end).ok_or(Error::OutOfBounds)?;
-    let mut cur = Cursor::new(list_view);
+    let len = usize::try_from(count)?
+        .checked_mul(width)
+        .ok_or(Error::OutOfBounds)?;
+    let end = start.checked_add(len).ok_or(Error::OutOfBounds)?;
+
+    master_view.get(start..end).ok_or(Error::OutOfBounds)
+}
+
+/// Parses the Path Pointer List (called the URL Pointer List before April 2024).
+/// See https://wiki.openzim.org/wiki/ZIM_file_format#Path_Pointer_List_(pathPtrPos)
+fn parse_url_list(master_view: &Mmap, ptr_pos: u64, count: u32) -> Result<Vec<u64>> {
+    let mut cur = Cursor::new(pointer_list_view(master_view, ptr_pos, count, 8)?);
 
     let mut out: Vec<u64> = Vec::new();
     for _ in 0..count {
@@ -279,14 +293,9 @@ fn parse_url_list(master_view: &Mmap, ptr_pos: u64, count: u32) -> Result<Vec<u6
 }
 
 fn parse_article_list(master_view: &Mmap, ptr_pos: u64, count: u32) -> Result<Vec<u32>> {
-    let start = usize::try_from(ptr_pos)?;
-    let end = start + usize::try_from(count)? * 4;
+    let mut cur = Cursor::new(pointer_list_view(master_view, ptr_pos, count, 4)?);
 
-    let list_view = master_view.get(start..end).ok_or(Error::OutOfBounds)?;
-
-    let mut cur = Cursor::new(list_view);
     let mut out: Vec<u32> = Vec::new();
-
     for _ in 0..count {
         out.push(cur.read_u32::<LittleEndian>()?);
     }
@@ -295,11 +304,8 @@ fn parse_article_list(master_view: &Mmap, ptr_pos: u64, count: u32) -> Result<Ve
 }
 
 fn parse_cluster_list(master_view: &Mmap, ptr_pos: u64, count: u32) -> Result<Vec<u64>> {
-    let start = usize::try_from(ptr_pos)?;
-    let end = start + usize::try_from(count)? * 8;
-    let cluster_list_view = master_view.get(start..end).ok_or(Error::OutOfBounds)?;
+    let mut cluster_cur = Cursor::new(pointer_list_view(master_view, ptr_pos, count, 8)?);
 
-    let mut cluster_cur = Cursor::new(cluster_list_view);
     let mut out: Vec<u64> = Vec::new();
     for _ in 0..count {
         out.push(cluster_cur.read_u64::<LittleEndian>()?);
@@ -310,7 +316,8 @@ fn parse_cluster_list(master_view: &Mmap, ptr_pos: u64, count: u32) -> Result<Ve
 /// Read out the the 16 byte long MD5 checksum.
 fn read_checksum(master_view: &Mmap, checksum_pos: u64) -> Result<Checksum> {
     let checksum_pos = usize::try_from(checksum_pos)?;
-    match master_view.get(checksum_pos..checksum_pos + 16) {
+    let end = checksum_pos.checked_add(16).ok_or(Error::OutOfBounds)?;
+    match master_view.get(checksum_pos..end) {
         Some(raw) => {
             let mut arr = Array::default();
             arr.copy_from_slice(raw);
@@ -424,6 +431,34 @@ mod tests {
 
         let entries = zim.iterate_by_urls().collect::<Result<Vec<_>>>().unwrap();
         assert_eq!(entries.len(), 19);
+    }
+
+    /// Indices reaching the public accessors come from the archive itself - redirect targets,
+    /// dirent cluster numbers, the header's main page - so a corrupt file must produce an error
+    /// rather than abort the calling process.
+    #[test]
+    fn out_of_range_accessors_error_instead_of_panicking() {
+        let zim = Zim::new("fixtures/speedtest_en_blob-mini_2024-05.zim")
+            .expect("failed to parse fixture");
+
+        assert!(zim.get_by_url_index(zim.header.article_count).is_err());
+        assert!(zim.get_by_url_index(u32::MAX).is_err());
+
+        assert!(zim.get_cluster(zim.header.cluster_count).is_err());
+        assert!(zim.get_cluster(u32::MAX).is_err());
+
+        let cluster = zim.get_cluster(0).unwrap();
+        assert!(cluster.get_blob(u32::MAX).is_err());
+
+        // Probe upwards for the first rejected blob index. The offset table carries one entry
+        // more than there are blobs, and treating that end sentinel as a blob used to hand back
+        // a bogus slice instead of erroring.
+        let mut blobs = 0u32;
+        while cluster.get_blob(blobs).is_ok() {
+            blobs += 1;
+            assert!(blobs < 10_000, "blob index probe failed to terminate");
+        }
+        assert!(blobs > 0, "cluster 0 should contain at least one blob");
     }
 
     #[test]

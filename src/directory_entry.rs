@@ -47,18 +47,8 @@ impl DirectoryEntry {
             Some(Target::Cluster(cluster_number, blob_number))
         };
 
-        let url = {
-            let mut vec = Vec::new();
-            let size = cur.read_until(0, &mut vec)?;
-            vec.truncate(size - 1);
-            String::from_utf8(vec)?
-        };
-        let title = {
-            let mut vec = Vec::new();
-            let size = cur.read_until(0, &mut vec)?;
-            vec.truncate(size - 1);
-            String::from_utf8(vec)?
-        };
+        let url = read_nul_terminated(&mut cur)?;
+        let title = read_nul_terminated(&mut cur)?;
 
         Ok(DirectoryEntry {
             mime_type,
@@ -69,4 +59,19 @@ impl DirectoryEntry {
             target,
         })
     }
+}
+
+/// Reads a NUL-terminated string.
+///
+/// The slice handed to [`DirectoryEntry::new`] extends to the end of the archive, so a missing
+/// terminator would otherwise scan past the entry and, because the length is used unchecked,
+/// underflow. Treat it as a parse failure, as libzim does.
+fn read_nul_terminated(cur: &mut Cursor<&[u8]>) -> Result<String> {
+    let mut vec = Vec::new();
+    let size = cur.read_until(0, &mut vec)?;
+    if size == 0 || vec.last() != Some(&0) {
+        return Err(Error::UnterminatedString);
+    }
+    vec.truncate(size - 1);
+    Ok(String::from_utf8(vec)?)
 }
