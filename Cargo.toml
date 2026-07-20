@@ -13,6 +13,8 @@ edition = "2021"
 keywords = ["parser", "zim"]
 categories = ["encoding", "parser-implementations"]
 
+exclude = ["/fixtures"]
+
 [dependencies]
 byteorder = "^1.2"
 memmap = "^0.7"
