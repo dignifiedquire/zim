@@ -8,7 +8,7 @@ use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use stopwatch::Stopwatch;
-use zim::{Cluster, DirectoryEntry, MimeType, Namespace, Target, Zim};
+use zim::{DirectoryEntry, MimeType, Namespace, Target, Zim};
 
 /// Extract zim files into their on disk structure.
 #[derive(Parser, Debug)]
@@ -23,12 +23,24 @@ struct Args {
     /// Write files to disk, instead of using hard links
     #[arg(long, default_value_t = false)]
     flatten_link: bool,
+    /// Number of clusters to extract in parallel (default: one per core).
+    ///
+    /// Peak memory is roughly this many decompressed clusters, so lower it for large archives.
+    #[arg(long, short)]
+    jobs: Option<usize>,
     #[arg(required = true)]
     input: String,
 }
 
 fn main() {
     let args = Args::parse();
+
+    if let Some(jobs) = args.jobs {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(jobs)
+            .build_global()
+            .expect("failed to configure the thread pool");
+    }
 
     let skip_link = args.skip_link;
     let flatten_link = args.flatten_link;
@@ -61,25 +73,34 @@ fn main() {
 
     ensure_dir(root_output);
 
-    // map between cluster and directory entry
-    let mut cluster_map = HashMap::new();
-
-    for i in 0..zim_file.header.cluster_count {
-        let cluster = zim_file.get_cluster(i).expect("failed to retrieve cluster");
-        cluster_map.insert(i, cluster);
-    }
-
-    let mut entries = Vec::new();
+    // Group content entries by the cluster holding them, so extraction runs one cluster at a
+    // time per thread: each is decompressed once, written out, then dropped. Holding every
+    // cluster - as a map built up front does - keeps the whole archive decompressed at once.
+    //
+    // Only entry indices are kept. Re-reading a directory entry is a cheap mapped read, whereas
+    // holding every entry's path and title costs more than the cluster data does.
+    pb.set_message("Scanning entries");
+    let mut by_cluster: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut redirects: Vec<u32> = Vec::new();
     let mut unreadable = 0usize;
-    for entry in zim_file.iterate_by_urls() {
-        match entry {
-            Ok(entry) => entries.push(entry),
+
+    for idx in 0..zim_file.header.article_count {
+        match zim_file.get_by_url_index(idx) {
+            Ok(entry) => match entry.target {
+                Some(Target::Cluster(cluster, _)) => {
+                    by_cluster.entry(cluster).or_default().push(idx)
+                }
+                Some(Target::Redirect(_)) => redirects.push(idx),
+                None => {}
+            },
             Err(err) => {
                 unreadable += 1;
                 eprintln!("skipping unreadable entry: {}", err);
             }
         }
+        pb.inc(1);
     }
+
     if unreadable > 0 {
         eprintln!(
             "warning: {} of {} entries could not be read",
@@ -87,32 +108,30 @@ fn main() {
         );
     }
 
+    // Sorted so clusters are taken up in file order, and so a run is reproducible.
+    let mut by_cluster: Vec<(u32, Vec<u32>)> = by_cluster.into_iter().collect();
+    by_cluster.sort_unstable_by_key(|(cluster, _)| *cluster);
+
     pb.set_message("Writing entries to disk");
-    entries
-        .par_iter()
-        .filter(|entry| {
-            if let Some(Target::Cluster(_, _)) = entry.target.as_ref() {
-                return true;
-            }
-            false
-        })
-        .for_each(|entry| {
-            process_file(root_output, &cluster_map, entry, &pb);
-        });
+    pb.set_length(by_cluster.iter().map(|(_, e)| e.len() as u64).sum());
+    pb.set_position(0);
+
+    by_cluster.par_iter().for_each(|(cluster_idx, entries)| {
+        extract_cluster(&zim_file, root_output, *cluster_idx, entries, &pb);
+    });
 
     if !skip_link {
         pb.set_message("Generating links");
-        entries
-            .par_iter()
-            .filter(|entry| {
-                if let Some(Target::Redirect(_)) = entry.target.as_ref() {
-                    return true;
-                }
-                false
-            })
-            .for_each(|entry| {
-                process_link(&zim_file, root_output, entry, skip_link, flatten_link, &pb);
-            });
+        pb.set_length(redirects.len() as u64);
+        pb.set_position(0);
+
+        redirects.par_iter().for_each(|&idx| {
+            match zim_file.get_by_url_index(idx) {
+                Ok(entry) => process_link(&zim_file, root_output, entry, flatten_link),
+                Err(err) => eprintln!("skipping unreadable entry: {}", err),
+            }
+            pb.inc(1);
+        });
     }
 
     pb.finish_with_message(format!(
@@ -158,66 +177,83 @@ fn ensure_dir(path: &Path) {
         .unwrap_or_else(|e| ignore_exists_err(e, format!("create: {}", path.display())));
 }
 
-fn process_file<'a>(
-    root_output: &Path,
-    cluster_map: &'a HashMap<u32, Cluster<'a>>,
-    entry: &DirectoryEntry,
-    pb: &ProgressBar,
-) {
-    let dst = make_path(root_output, entry.namespace, &entry.url, &entry.mime_type);
-    match entry.target.as_ref() {
-        Some(Target::Cluster(cluster_index, blob_idx)) => {
-            let cluster = cluster_map.get(cluster_index).expect("missing cluster");
-
-            // The blob is borrowed from the cluster rather than copied out; blobs can be very
-            // large, and the cluster's decompressed buffer is shared by all of them.
-            let written = cluster
-                .read()
-                .and_then(|guard| guard.blob(*blob_idx).map(|blob| safe_write(&dst, blob, 1)));
-
-            if let Err(err) = written {
-                eprintln!("skipping invalid blob: {}: {}", dst.display(), err);
-            }
-            pb.inc(1);
-        }
-        Some(_) => unreachable!("filtered out earlier"),
-        None => {
-            eprintln!("skipping missing target {} {:?}", dst.display(), entry);
-        }
-    }
-}
-fn process_link(
+/// Writes out every entry whose content lives in one cluster.
+///
+/// The cluster is loaded once here and dropped on return, so its decompressed data does not
+/// outlive the entries that need it. Blobs are borrowed from it rather than copied out.
+fn extract_cluster(
     zim_file: &Zim,
     root_output: &Path,
-    entry: &DirectoryEntry,
-    skip_link: bool,
-    flatten_link: bool,
+    cluster_idx: u32,
+    entries: &[u32],
     pb: &ProgressBar,
 ) {
-    let dst = make_path(root_output, entry.namespace, &entry.url, &entry.mime_type);
+    // The guard borrows the cluster, so the cluster has to outlive it - and both are dropped on
+    // return, which is what frees the decompressed data.
+    let cluster = match zim_file.get_cluster(cluster_idx) {
+        Ok(cluster) => cluster,
+        Err(err) => {
+            eprintln!("skipping cluster {}: {}", cluster_idx, err);
+            pb.inc(entries.len() as u64);
+            return;
+        }
+    };
 
-    if entry.target.is_none() {
-        eprintln!("skipping missing target {:?} {:?}", dst, entry);
+    let guard = match cluster.read() {
+        Ok(guard) => guard,
+        Err(err) => {
+            eprintln!("skipping cluster {}: {}", cluster_idx, err);
+            pb.inc(entries.len() as u64);
+            return;
+        }
+    };
+
+    for &idx in entries {
+        let entry = match zim_file.get_by_url_index(idx) {
+            Ok(entry) => entry,
+            Err(err) => {
+                eprintln!("skipping unreadable entry: {}", err);
+                pb.inc(1);
+                continue;
+            }
+        };
+
+        if let Some(Target::Cluster(_, blob_idx)) = entry.target {
+            let dst = make_path(root_output, entry.namespace, &entry.url, &entry.mime_type);
+
+            match guard.blob(blob_idx) {
+                Ok(blob) => safe_write(&dst, blob, 1),
+                Err(err) => eprintln!("skipping invalid blob: {}: {}", dst.display(), err),
+            }
+        }
+
+        pb.inc(1);
+    }
+}
+
+fn process_link(zim_file: &Zim, root_output: &Path, entry: DirectoryEntry, flatten_link: bool) {
+    let dst = make_path(root_output, entry.namespace, &entry.url, &entry.mime_type);
+    if dst.exists() {
         return;
     }
 
-    match entry.target.as_ref() {
-        Some(Target::Redirect(redir)) => {
-            if !skip_link && !dst.exists() {
-                pb.inc_length(1);
-
-                let entry = {
-                    zim_file
-                        .get_by_url_index(*redir)
-                        .expect("failed to get_by_url_index")
-                };
-                let src = make_path(root_output, entry.namespace, &entry.url, &entry.mime_type);
-                make_link(src, dst, flatten_link);
-                pb.inc(1);
-            }
+    // A redirect may point at another redirect, so follow the chain to the entry actually
+    // holding the content - that is the file which exists on disk to link to.
+    let target = match zim_file.resolve(entry) {
+        Ok(target) => target,
+        Err(err) => {
+            eprintln!("skipping link {}: {}", dst.display(), err);
+            return;
         }
-        _ => panic!("must be filtered before"),
-    }
+    };
+
+    let src = make_path(
+        root_output,
+        target.namespace,
+        &target.url,
+        &target.mime_type,
+    );
+    make_link(src, dst, flatten_link);
 }
 
 fn make_link(src: PathBuf, mut dst: PathBuf, flatten_link: bool) {
