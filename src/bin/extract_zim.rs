@@ -52,7 +52,7 @@ fn main() {
     }
     println!();
 
-    let pb = ProgressBar::new(zim_file.article_count() as u64);
+    let pb = ProgressBar::new(zim_file.header.article_count as u64);
     pb.enable_steady_tick(Duration::from_millis(100));
     let style = ProgressStyle::default_bar()
         .template(

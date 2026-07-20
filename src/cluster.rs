@@ -82,7 +82,7 @@ impl<'a> fmt::Debug for Cluster<'a> {
 impl<'a> Cluster<'a> {
     pub fn new(
         master_view: &'a Mmap,
-        cluster_list: &'a Vec<u64>,
+        cluster_list: &'a [u64],
         idx: u32,
         checksum_pos: u64,
         version: u16,
@@ -146,7 +146,7 @@ impl<'a, 'b: 'a> AsRef<[u8]> for Blob<'a, 'b> {
 impl<'a> InnerCluster<'a> {
     fn new(
         master_view: &'a Mmap,
-        cluster_list: &'a Vec<u64>,
+        cluster_list: &'a [u64],
         idx: u32,
         checksum_pos: u64,
         version: u16,
@@ -271,7 +271,8 @@ impl<'a> InnerCluster<'a> {
 ///   - 0: default (no compression),
 ///   - 1: none (inherited from Zeno),
 ///   - 4: LZMA2 compressed
-/// Firth bits :
+///
+/// Firth bits:
 ///   - 0: normal (OFFSET_SIZE=4)
 ///   - 1: extended (OFFSET_SIZE=8)
 fn parse_details(details: &u8) -> Result<(bool, Compression)> {

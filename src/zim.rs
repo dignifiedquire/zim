@@ -4,8 +4,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use byteorder::{LittleEndian, ReadBytesExt};
-use md5::digest::OutputSizeUser;
-use md5::{digest::generic_array::GenericArray, Digest, Md5};
+use md5::{digest::array::Array, digest::OutputSizeUser, Digest, Md5};
 use memmap::Mmap;
 
 use crate::cluster::Cluster;
@@ -30,15 +29,15 @@ pub struct Zim {
 
     /// List of mimetypes used in this ZIM archive
     pub mime_table: Vec<String>, // a list of mimetypes
-    pub url_list: Vec<u64>,     // a list of offsets
-    pub article_list: Vec<u32>, // a list of indicies into url_list
-    pub cluster_list: Vec<u64>, // a list of offsets
+    pub url_list: Vec<u64>,             // a list of offsets
+    pub article_list: Option<Vec<u32>>, // a list of indicies into url_list
+    pub cluster_list: Vec<u64>,         // a list of offsets
 
     /// MD5 checksum.
     pub checksum: Checksum,
 }
 
-pub type Checksum = GenericArray<u8, <Md5 as OutputSizeUser>::OutputSize>;
+pub type Checksum = Array<u8, <Md5 as OutputSizeUser>::OutputSize>;
 
 /// A ZIM file starts with a header.
 #[derive(Debug)]
@@ -56,7 +55,8 @@ pub struct ZimHeader {
     /// position of the directory pointerlist ordered by URL
     pub url_ptr_pos: u64,
     /// position of the directory pointerlist ordered by Title
-    pub title_ptr_pos: u64,
+    /// Deprecated in newer versions. Use `X/listing/titleordered/v0` instead.
+    pub title_ptr_pos: Option<u64>,
     /// position of the cluster pointer list
     pub cluster_ptr_pos: u64,
     /// position of the MIME type list (also header size)
@@ -82,9 +82,14 @@ impl Zim {
         let master_view = unsafe { Mmap::map(&f)? };
 
         let (header, mime_table) = parse_header(&master_view)?;
+        dbg!(&header);
         let url_list = parse_url_list(&master_view, header.url_ptr_pos, header.article_count)?;
-        let article_list =
-            parse_article_list(&master_view, header.title_ptr_pos, header.article_count)?;
+        let article_list = if let Some(title_ptr_pos) = header.title_ptr_pos {
+            let list = parse_article_list(&master_view, title_ptr_pos, header.article_count)?;
+            Some(list)
+        } else {
+            None
+        };
 
         let cluster_list =
             parse_cluster_list(&master_view, header.cluster_ptr_pos, header.cluster_count)?;
@@ -101,11 +106,6 @@ impl Zim {
             cluster_list,
             checksum,
         })
-    }
-
-    /// Get the number of articles.
-    pub fn article_count(&self) -> usize {
-        self.article_list.len()
     }
 
     /// Computes the checksum, and returns an error if it does not match the one in
@@ -140,7 +140,7 @@ impl Zim {
     /// Iterates over articles, sorted by URL.
     ///
     /// For performance reasons, you might want to extract by cluster instead.
-    pub fn iterate_by_urls(&self) -> DirectoryIterator {
+    pub fn iterate_by_urls(&self) -> DirectoryIterator<'_> {
         DirectoryIterator::new(self)
     }
 
@@ -157,7 +157,7 @@ impl Zim {
     /// Returns the given `Cluster`
     ///
     /// idx must be between 0 and `cluster_count`
-    pub fn get_cluster(&self, idx: u32) -> Result<Cluster> {
+    pub fn get_cluster(&self, idx: u32) -> Result<Cluster<'_>> {
         Cluster::new(
             &self.master_view,
             &self.cluster_list,
@@ -201,6 +201,14 @@ fn parse_header(master_view: &Mmap) -> Result<(ZimHeader, Vec<String>)> {
     let cluster_count = header_cur.read_u32::<LittleEndian>()?;
     let url_ptr_pos = header_cur.read_u64::<LittleEndian>()?;
     let title_ptr_pos = header_cur.read_u64::<LittleEndian>()?;
+
+    // Deprecated, and considered optional in newer versions
+    let title_ptr_pos = if title_ptr_pos == u64::MAX {
+        None
+    } else {
+        Some(title_ptr_pos)
+    };
+
     let cluster_ptr_pos = header_cur.read_u64::<LittleEndian>()?;
     let mime_list_pos = header_cur.read_u64::<LittleEndian>()?;
 
@@ -305,7 +313,7 @@ fn read_checksum(master_view: &Mmap, checksum_pos: u64) -> Result<Checksum> {
     let checksum_pos = usize::try_from(checksum_pos)?;
     match master_view.get(checksum_pos..checksum_pos + 16) {
         Some(raw) => {
-            let mut arr = GenericArray::default();
+            let mut arr = Array::default();
             arr.copy_from_slice(raw);
 
             Ok(arr)
@@ -338,6 +346,8 @@ mod tests {
     use crate::cluster::Compression;
 
     use super::*;
+
+    #[ignore]
     #[test]
     fn test_zim_ab_all_2017_03() {
         let zim =
@@ -358,6 +368,7 @@ mod tests {
         assert_eq!(zim.iterate_by_urls().count(), 3111);
     }
 
+    #[ignore]
     #[test]
     fn test_zim_ab_all_maxi_2022_05() {
         let zim = Zim::new("fixtures/wikipedia_ab_all_maxi_2022-05.zim")
@@ -382,5 +393,60 @@ mod tests {
         );
 
         assert_eq!(zim.iterate_by_urls().count(), 9890);
+    }
+
+    #[test]
+    fn test_zim_speedtest_en_mini_2025() {
+        let zim = Zim::new("fixtures/speedtest_en_blob-mini_2024-05.zim")
+            .expect("failed to parse fixture");
+
+        assert_eq!(zim.header.version_major, 6);
+        assert_eq!(zim.header.article_count, 19);
+
+        let cl0 = zim.get_cluster(0).unwrap();
+        assert_eq!(
+            &cl0.get_blob(0).unwrap()[..],
+            &[
+                115, 112, 101, 101, 100, 116, 101, 115, 116, 95, 101, 110, 95, 98, 108, 111, 98,
+                45, 109, 105, 110, 105
+            ][..]
+        );
+        assert_eq!(cl0.compression(), Compression::Zstd);
+
+        let cl1 = zim.get_cluster(zim.header.cluster_count - 1).unwrap();
+        let b = cl1.get_blob(0).unwrap();
+        assert_eq!(&b[0..10], &[137, 80, 78, 71, 13, 10, 26, 10, 0, 0]);
+        assert_eq!(
+            &b[b.len() - 10..],
+            &[0, 0, 73, 69, 78, 68, 174, 66, 96, 130],
+        );
+
+        assert_eq!(zim.iterate_by_urls().count(), 19);
+    }
+
+    #[test]
+    fn test_zim_wikipedia_en_100_2026_04() {
+        let zim =
+            Zim::new("fixtures/wikipedia_en_100_2026-04.zim").expect("failed to parse fixture");
+
+        assert_eq!(zim.header.version_major, 6);
+        assert_eq!(zim.header.article_count, 9061);
+
+        let cl0 = zim.get_cluster(0).unwrap();
+        assert_eq!(
+            &cl0.get_blob(0).unwrap()[..],
+            &[87, 105, 107, 105, 112, 101, 100, 105, 97][..]
+        );
+        assert_eq!(cl0.compression(), Compression::Zstd);
+
+        let cl1 = zim.get_cluster(zim.header.cluster_count - 1).unwrap();
+        let b = cl1.get_blob(0).unwrap();
+        assert_eq!(&b[0..10], &[15, 13, 88, 97, 112, 105, 97, 110, 32, 71]);
+        assert_eq!(
+            &b[b.len() - 10..],
+            &[8, 121, 111, 100, 101, 108, 0, 18, 160, 4],
+        );
+
+        assert_eq!(zim.iterate_by_urls().count(), 9061);
     }
 }

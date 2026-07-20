@@ -25,10 +25,13 @@ fn main() -> Result<()> {
         zim_file.header.version_major, zim_file.header.version_minor
     );
 
-    println!("UUID: {}", &zim_file.header.uuid);
+    println!("UUID: {}", zim_file.header.uuid);
     println!(
         "Article Count: {}",
-        zim_file.article_count().to_formatted_string(&Locale::en)
+        zim_file
+            .header
+            .article_count
+            .to_formatted_string(&Locale::en)
     );
     println!(
         "Mime List Pos: {}",
@@ -42,11 +45,11 @@ fn main() -> Result<()> {
         zim_file.header.url_ptr_pos.to_formatted_string(&Locale::en)
     );
     println!(
-        "Title Index Pos: {}",
+        "Title Index Pos: {:?}",
         zim_file
             .header
             .title_ptr_pos
-            .to_formatted_string(&Locale::en)
+            .map(|t| t.to_formatted_string(&Locale::en))
     );
     println!(
         "Cluster Count: {}",
