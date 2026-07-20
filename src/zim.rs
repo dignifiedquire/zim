@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::fs::File;
 use std::io::Cursor;
 use std::io::{BufRead, BufReader, Read};
@@ -12,6 +13,7 @@ use crate::directory_entry::DirectoryEntry;
 use crate::directory_iterator::DirectoryIterator;
 use crate::errors::{Error, Result};
 use crate::mime_type::MimeType;
+use crate::namespace::Namespace;
 use crate::uuid::Uuid;
 
 /// Magic number to recognise the file format, must be 72173914
@@ -207,6 +209,42 @@ impl Zim {
             .ok_or(Error::OutOfBounds)?;
 
         DirectoryEntry::new(self, dir_view)
+    }
+
+    /// Returns the index of the entry at `namespace`/`path`, if it exists.
+    ///
+    /// Directory entries are stored ordered by their full path - the namespace byte followed by
+    /// the path, compared as UTF-8 bytes - so this is a binary search over the path pointer list
+    /// rather than a scan.
+    ///
+    /// Note that in the new namespace scheme (format version 6.1 and later) the stored path does
+    /// not include the namespace, which is why it is passed separately.
+    pub fn find_by_path(&self, namespace: Namespace, path: &str) -> Result<Option<u32>> {
+        let target = (namespace.as_byte(), path.as_bytes());
+
+        let mut low = 0usize;
+        let mut high = self.url_list.len();
+
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let entry = self.get_by_url_index(mid as u32)?;
+
+            match (entry.namespace.as_byte(), entry.url.as_bytes()).cmp(&target) {
+                Ordering::Less => low = mid + 1,
+                Ordering::Greater => high = mid,
+                Ordering::Equal => return Ok(Some(mid as u32)),
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Returns the entry at `namespace`/`path`, if it exists.
+    pub fn get_by_path(&self, namespace: Namespace, path: &str) -> Result<Option<DirectoryEntry>> {
+        match self.find_by_path(namespace, path)? {
+            Some(idx) => Ok(Some(self.get_by_url_index(idx)?)),
+            None => Ok(None),
+        }
     }
 
     /// Returns the given `Cluster`
@@ -483,6 +521,85 @@ mod tests {
 
         let entries = zim.iterate_by_urls().collect::<Result<Vec<_>>>().unwrap();
         assert_eq!(entries.len(), 19);
+    }
+
+    /// `find_by_path` is a binary search, which is only sound because the format guarantees that
+    /// directory entries are stored ordered by namespace byte then path.
+    #[test]
+    fn entries_are_ordered_by_namespace_and_path() {
+        for fixture in [
+            "fixtures/speedtest_en_blob-mini_2024-05.zim",
+            "fixtures/wikipedia_en_100_2026-04.zim",
+        ] {
+            let zim = Zim::new(fixture).expect("failed to parse fixture");
+            let entries = zim
+                .iterate_by_urls()
+                .collect::<Result<Vec<_>>>()
+                .expect("failed to read entries");
+
+            for pair in entries.windows(2) {
+                let before = (pair[0].namespace.as_byte(), pair[0].url.as_str());
+                let after = (pair[1].namespace.as_byte(), pair[1].url.as_str());
+                assert!(
+                    before < after,
+                    "{fixture}: {before:?} must precede {after:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn find_by_path_locates_well_known_entries() {
+        let zim =
+            Zim::new("fixtures/wikipedia_en_100_2026-04.zim").expect("failed to parse fixture");
+
+        // The entries a reader needs in order to resolve anything in a 6.1+ archive.
+        for (namespace, path) in [
+            (Namespace::CategoriesArticle, "mainPage"),
+            (Namespace::FulltextIndex, "listing/titleOrdered/v1"),
+            (Namespace::FulltextIndex, "fulltext/xapian"),
+            (Namespace::FulltextIndex, "title/xapian"),
+            (Namespace::Metadata, "Title"),
+            (Namespace::Metadata, "Illustration_48x48@1"),
+        ] {
+            let found = zim.find_by_path(namespace, path).unwrap();
+            assert!(found.is_some(), "{namespace:?}/{path} should be found");
+
+            let entry = zim.get_by_path(namespace, path).unwrap().unwrap();
+            assert_eq!(entry.url, path);
+            assert_eq!(entry.namespace, namespace);
+        }
+
+        assert_eq!(
+            zim.find_by_path(Namespace::UserContent, "definitely/not/here")
+                .unwrap(),
+            None
+        );
+        // Present as a path, but only under a different namespace.
+        assert_eq!(
+            zim.find_by_path(Namespace::UserContent, "mainPage")
+                .unwrap(),
+            None
+        );
+    }
+
+    /// Every entry must be findable at exactly its own index, which catches comparator mistakes
+    /// that spot checks on a handful of paths would miss.
+    #[test]
+    fn find_by_path_agrees_with_iteration() {
+        let zim = Zim::new("fixtures/speedtest_en_blob-mini_2024-05.zim")
+            .expect("failed to parse fixture");
+
+        for (idx, entry) in zim.iterate_by_urls().enumerate() {
+            let entry = entry.expect("failed to read entry");
+            assert_eq!(
+                zim.find_by_path(entry.namespace, &entry.url).unwrap(),
+                Some(idx as u32),
+                "{:?}/{}",
+                entry.namespace,
+                entry.url
+            );
+        }
     }
 
     /// Contradictory header offsets must be caught when the archive is opened. Otherwise they
