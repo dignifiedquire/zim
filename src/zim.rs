@@ -256,20 +256,19 @@ impl ZimHeader {
     /// Mirrors libzim's own header validation. Without it, contradictory offsets are only
     /// discovered much later, as an out-of-bounds read against an unrelated structure.
     fn sanity_check(&self, file_len: u64) -> Result<()> {
-        if self.mime_list_pos < HEADER_SIZE {
-            return Err(Error::InvalidHeader("mimeListPos overlaps the header"));
-        }
-        if self.mime_list_pos > file_len {
-            return Err(Error::InvalidHeader("mimeListPos is past the end of file"));
+        // The MIME type list follows directly after the header, so this doubles as the header
+        // size and every writer emits exactly 80. Accepting anything else is not forward
+        // compatibility, it is silent corruption: the list is then read from the middle of
+        // another structure and yields plausible-looking but wrong types for every entry.
+        if self.mime_list_pos != HEADER_SIZE {
+            return Err(Error::InvalidHeader("mimeListPos is not the header size"));
         }
 
-        // Every other structure is stored after the MIME type list.
+        // Every other structure is stored after the MIME type list. `titlePtrPos` is deliberately
+        // absent: it is deprecated, and an archive carrying a stale one is still perfectly
+        // readable through the listing entries, so it must not be grounds for rejection.
         for (pos, what) in [
             (self.url_ptr_pos, "pathPtrPos precedes mimeListPos"),
-            (
-                self.title_ptr_pos.unwrap_or(u64::MAX),
-                "titlePtrPos precedes mimeListPos",
-            ),
             (self.cluster_ptr_pos, "clusterPtrPos precedes mimeListPos"),
             (self.checksum_pos, "checksumPos precedes mimeListPos"),
         ] {
@@ -309,12 +308,6 @@ impl ZimHeader {
                 self.cluster_count,
                 8,
                 "cluster pointer list runs past the end of file",
-            ),
-            (
-                self.title_ptr_pos.unwrap_or(0),
-                self.title_ptr_pos.map_or(0, |_| self.article_count),
-                4,
-                "title pointer list runs past the end of file",
             ),
         ] {
             let end = u64::from(count)
@@ -567,7 +560,19 @@ impl Zim {
             return Ok(Some(listing));
         }
 
-        Ok(self.header.title_ptr_pos.map(|pos| Listing {
+        // The header pointer is deprecated and not validated at open, precisely so that a stale
+        // one cannot make an otherwise readable archive unopenable. Check it here instead, and
+        // report the listing as absent rather than handing back one that errors on every access.
+        let Some(pos) = self.header.title_ptr_pos else {
+            return Ok(None);
+        };
+
+        let fits = u64::from(self.header.article_count)
+            .checked_mul(4)
+            .and_then(|len| pos.checked_add(len))
+            .is_some_and(|end| end <= self.store.len());
+
+        Ok(fits.then_some(Listing {
             source: Source::Region {
                 store: &self.store,
                 pos,

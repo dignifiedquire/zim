@@ -317,7 +317,7 @@ fn out_of_range_accessors_error_instead_of_panicking() {
 /// directory entries are stored ordered by namespace byte then path.
 #[test]
 fn entries_are_ordered_by_namespace_and_path() {
-    for name in [V50, V61, V62, V63, V63_BOOKS] {
+    for name in [V50, V50_BOOKS, V61, V62, V63, V63_BOOKS] {
         let zim = open(name);
         let entries = zim
             .iterate_by_urls()
@@ -371,7 +371,7 @@ fn find_by_path_locates_well_known_entries() {
 /// spot checks on a handful of paths would miss.
 #[test]
 fn find_by_path_agrees_with_iteration() {
-    for name in [V50, V63, V63_BOOKS] {
+    for name in [V50, V50_BOOKS, V63, V63_BOOKS] {
         let zim = open(name);
 
         for (idx, entry) in zim.iterate_by_urls().enumerate() {
@@ -686,4 +686,420 @@ fn chunk_discovery_prefers_the_whole_archive_and_stops_at_a_gap() {
     std::fs::write(&base, &raw).unwrap();
     let whole = Zim::new(&base).expect("failed to open whole archive");
     assert_eq!(whole.store.len(), raw.len() as u64);
+}
+
+/// Format version 5.0, multi-cluster: the only legacy-namespace archive with enough entries to
+/// put a namespace boundary in the middle of a binary search.
+const V50_BOOKS: &str = "withns/wikibooks_be_all_nopic_2017-02.zim";
+
+/// What a deliberately corrupted archive is expected to do.
+///
+/// The point is the *tier*, not just "it fails somewhere": a lazy failure silently becoming an
+/// open failure, or vice versa, is what breaks real archives, and a blanket "does not panic" loop
+/// cannot see that.
+#[derive(Debug, PartialEq)]
+enum Fails {
+    /// Rejected by `Zim::new`.
+    AtOpen,
+    /// Opens, but this entry index fails to parse.
+    AtEntry(usize),
+    /// Opens and every entry parses, but this cluster cannot be read.
+    AtCluster(u32),
+    /// Opens and reads clean - we have no validator for this corruption.
+    Never,
+}
+
+/// Classifies an archive by where it first fails.
+fn failure_tier(path: &Path) -> Fails {
+    let Ok(zim) = Zim::new(path) else {
+        return Fails::AtOpen;
+    };
+
+    for (idx, entry) in zim.iterate_by_urls().enumerate() {
+        if entry.is_err() {
+            return Fails::AtEntry(idx);
+        }
+    }
+
+    for idx in 0..zim.header.cluster_count {
+        if zim
+            .get_cluster(idx)
+            .and_then(|c| c.read().map(|_| ()))
+            .is_err()
+        {
+            return Fails::AtCluster(idx);
+        }
+    }
+
+    Fails::Never
+}
+
+/// Every corrupted archive in the suite, across all three variant builds, pinned to the exact
+/// point at which it fails.
+#[test]
+fn corrupt_archives_fail_at_the_expected_point() {
+    for dir in ["withns", "nons", "noTitleListingV0"] {
+        let root = Path::new(FIXTURES).join(dir);
+        // `outofbounds_last_direntptr` breaks the final entry, whose index differs per variant.
+        let last = Zim::new(root.join("small.zim"))
+            .expect("variant must ship a good small.zim")
+            .header
+            .article_count as usize
+            - 1;
+
+        let mut seen = 0usize;
+        for entry in std::fs::read_dir(&root).expect("missing fixtures") {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_str().unwrap().to_string();
+            let Some(kind) = name
+                .strip_prefix("invalid.")
+                .and_then(|n| n.strip_suffix(".zim"))
+            else {
+                continue;
+            };
+            seen += 1;
+
+            let expected = match kind {
+                "smaller_than_header"
+                | "invalid_mimelistpos"
+                | "invalid_checksumpos"
+                | "outofbounds_urlptrpos"
+                | "outofbounds_clusterptrpos"
+                | "bad_mimetype_list" => Fails::AtOpen,
+
+                "outofbounds_first_direntptr" => Fails::AtEntry(0),
+                "outofbounds_last_direntptr" => Fails::AtEntry(last),
+                "bad_mimetype_in_dirent" => Fails::AtEntry(8),
+
+                "outofbounds_first_clusterptr" => Fails::AtCluster(0),
+                "offset_in_cluster"
+                | "too_large_offset_of_first_blob_in_cluster"
+                | "too_small_offset_of_first_blob_in_cluster_0"
+                | "too_small_offset_of_first_blob_in_cluster_7"
+                | "misaligned_offset_of_first_blob_in_cluster_9"
+                | "misaligned_offset_of_first_blob_in_cluster_10"
+                | "misaligned_offset_of_first_blob_in_cluster_11" => Fails::AtCluster(1),
+
+                // Corruptions we deliberately do not detect. Pinned so a change is visible:
+                // the dirent/title tables are not validated for ordering, an out-of-range title
+                // index is only caught when used, and a stale deprecated titlePtrPos must not
+                // make an otherwise readable archive unopenable.
+                "nonsorted_dirent_table"
+                | "nonsorted_title_index"
+                | "outofbounds_first_title_entry"
+                | "outofbounds_last_title_entry"
+                | "outofbounds_titleptrpos"
+                | "too_small_offset_of_first_blob_in_cluster_4" => Fails::Never,
+
+                other => panic!("unclassified corrupt fixture {dir}/{other} - add it to the table"),
+            };
+
+            assert_eq!(failure_tier(&path), expected, "{dir}/{name}");
+        }
+
+        assert!(seen >= 19, "{dir}: only {seen} corrupt fixtures found");
+    }
+}
+
+/// One unreadable entry must not cost the rest of the archive. Iteration reports it and carries
+/// on, and its neighbours stay reachable by index.
+#[test]
+fn a_single_bad_entry_does_not_poison_the_archive() {
+    let path = Path::new(FIXTURES).join("nons/invalid.bad_mimetype_in_dirent.zim");
+    let zim = Zim::new(&path).expect("only one dirent is corrupt");
+
+    let results: Vec<_> = zim.iterate_by_urls().collect();
+    assert_eq!(results.len(), zim.header.article_count as usize);
+    assert_eq!(
+        results.iter().filter(|r| r.is_err()).count(),
+        1,
+        "exactly one entry should fail"
+    );
+    assert!(results[8].is_err());
+
+    // Its neighbours are unaffected.
+    assert!(zim.get_by_url_index(7).is_ok());
+    assert!(zim.get_by_url_index(9).is_ok());
+}
+
+/// Listing entries hold entry indices straight off disk. Feeding one back in must be bounds
+/// checked - this is the step that turns a corrupt file into an out-of-range access.
+#[test]
+fn listing_indices_are_treated_as_untrusted() {
+    for name in [
+        "nons/invalid.outofbounds_first_title_entry.zim",
+        "nons/invalid.outofbounds_last_title_entry.zim",
+        "nons/invalid.nonsorted_title_index.zim",
+    ] {
+        let zim = Zim::new(Path::new(FIXTURES).join(name)).expect("these open clean");
+
+        let Some(listing) = zim.entry_list_by_title().unwrap() else {
+            continue;
+        };
+
+        let mut out_of_range = 0usize;
+        listing
+            .for_each(|idx| {
+                if zim.get_by_url_index(idx).is_err() {
+                    out_of_range += 1;
+                }
+            })
+            .unwrap();
+
+        // Whatever the listing claims, nothing may panic and the archive stays usable.
+        assert!(zim.get_by_url_index(0).is_ok(), "{name}");
+        let _ = out_of_range;
+    }
+}
+
+/// Redirects are a third of the entries in a real archive, and `resolve` is public API, yet the
+/// redirect branch of dirent parsing reads its target from the same field offset that holds the
+/// cluster number for content entries - a regression there yields a plausible wrong index.
+#[test]
+fn resolves_redirects_to_their_target() {
+    let zim = open(V63_BOOKS);
+
+    let redirects: Vec<_> = zim
+        .iterate_by_urls()
+        .map(|e| e.unwrap())
+        .filter(|e| e.mime_type == zim::MimeType::Redirect)
+        .collect();
+    assert_eq!(redirects.len(), 6);
+
+    for entry in redirects {
+        let Some(zim::Target::Redirect(target)) = entry.target else {
+            panic!("a redirect must carry a redirect target");
+        };
+        assert!(target < zim.header.article_count, "target in range");
+
+        // A redirect stores no content of its own.
+        assert!(zim.entry_content(&entry).unwrap().is_none());
+
+        let url = entry.url.clone();
+        let resolved = zim.resolve(entry).expect("redirect must resolve");
+        assert_ne!(
+            resolved.mime_type,
+            zim::MimeType::Redirect,
+            "{url} resolved to another redirect"
+        );
+        assert_eq!(
+            resolved.url,
+            zim.get_by_url_index(target).unwrap().url,
+            "{url} resolved somewhere other than its target"
+        );
+        assert!(zim.entry_content(&resolved).unwrap().is_some());
+    }
+}
+
+/// Overwrites the redirect target of entry `idx`, and returns the patched archive's path.
+///
+/// A redirect dirent is mimetype(2) parameterLen(1) namespace(1) revision(4) target(4), so the
+/// target sits at offset 8.
+fn patch_redirect_target(dir: &Path, source: &str, idx: u32, target: u32) -> PathBuf {
+    let mut raw = std::fs::read(fixture(source)).expect("failed to read fixture");
+
+    let url_ptr_pos = u64::from_le_bytes(raw[32..40].try_into().unwrap()) as usize;
+    let at = url_ptr_pos + idx as usize * 8;
+    let dirent = u64::from_le_bytes(raw[at..at + 8].try_into().unwrap()) as usize;
+
+    assert_eq!(
+        u16::from_le_bytes(raw[dirent..dirent + 2].try_into().unwrap()),
+        0xffff,
+        "entry {idx} of {source} must be a redirect"
+    );
+    raw[dirent + 8..dirent + 12].copy_from_slice(&target.to_le_bytes());
+
+    let path = dir.join(format!("redirect-{target}.zim"));
+    std::fs::write(&path, &raw).expect("failed to write patched archive");
+
+    path
+}
+
+/// A redirect may legally point at another redirect, so resolution follows the chain - which
+/// means a cycle has to be bounded. A self-redirect is the cheapest denial of service against a
+/// reader, and no fixture contains one.
+#[test]
+fn redirect_cycles_and_bad_targets_are_rejected() {
+    let dir: PathBuf = testdir!();
+
+    // Entry 12 of nons/small.zim is W/mainPage, a redirect to entry 1.
+    let looping = patch_redirect_target(&dir, V61, 12, 12);
+    let zim = Zim::new(&looping).expect("still a structurally valid archive");
+    let entry = zim.get_by_url_index(12).unwrap();
+    assert!(
+        matches!(zim.resolve(entry), Err(Error::RedirectLoop)),
+        "a self-redirect must be caught, not followed forever"
+    );
+
+    let dangling = patch_redirect_target(&dir, V61, 12, u32::MAX);
+    let zim = Zim::new(&dangling).expect("still a structurally valid archive");
+    let entry = zim.get_by_url_index(12).unwrap();
+    assert!(
+        matches!(zim.resolve(entry), Err(Error::OutOfBounds)),
+        "a target past the end must error, not panic"
+    );
+}
+
+/// The suite ships archives already split by `zimsplit`, cut between clusters as the format
+/// requires and into wildly unequal parts. Our own chunking test uses uniform parts, so this is
+/// the only cover for a reader that assumes a fixed part stride.
+#[test]
+fn reads_the_suite_pre_split_archives() {
+    for dir in ["withns", "nons", "noTitleListingV0"] {
+        let whole = Zim::new(
+            Path::new(FIXTURES)
+                .join(dir)
+                .join("wikibooks_be_all_nopic_2017-02.zim"),
+        )
+        .expect("failed to open the single-file archive");
+
+        let base = Path::new(FIXTURES)
+            .join(dir)
+            .join("wikibooks_be_all_nopic_2017-02_splitted.zim");
+        assert!(!base.exists(), "the split archive has no whole-file form");
+
+        let split = Zim::new(&base).unwrap_or_else(|e| panic!("{dir}: {e}"));
+
+        assert_eq!(split.store.len(), whole.store.len(), "{dir}");
+        assert_eq!(
+            split.header.article_count, whole.header.article_count,
+            "{dir}"
+        );
+        assert_eq!(snapshot(&split), snapshot(&whole), "{dir}");
+        split
+            .verify_checksum()
+            .unwrap_or_else(|e| panic!("{dir}: {e}"));
+
+        // Naming the first chunk resolves the same archive.
+        let via_chunk =
+            Zim::new(base.with_extension("zimaa")).unwrap_or_else(|e| panic!("{dir}: {e}"));
+        assert_eq!(via_chunk.store.len(), whole.store.len(), "{dir}");
+    }
+}
+
+/// A `.zimaa` name always means the chunked archive. If that rule were dropped, the name would
+/// silently open a single-file archive of the same stem - a wrong-file bug producing a perfectly
+/// valid result that no other assertion could catch.
+#[test]
+fn a_first_chunk_name_never_opens_a_whole_archive() {
+    // This archive exists only in single-file form, so its `.zimaa` name must not resolve.
+    let single = fixture("nons/wikibooks_be_all_nopic_2017-02.zim");
+    assert!(single.exists());
+
+    assert!(
+        Zim::new(single.with_extension("zimaa")).is_err(),
+        "a .zimaa name must not fall back to the whole archive"
+    );
+}
+
+/// Reads every blob of every fixture. Covers the last cluster's extent, which is derived from
+/// `checksumPos` rather than the pointer table, and both decoders, in one pass.
+#[test]
+fn reads_every_blob_of_every_fixture() {
+    // name, total blobs across all clusters
+    for (name, total) in [
+        (V50, 16),
+        (V50_BOOKS, 113),
+        (V61, 15),
+        (V62, 4001),
+        (V63, 15),
+        (V63_BOOKS, 117),
+    ] {
+        let zim = open(name);
+
+        let mut blobs = 0usize;
+        let mut bytes = 0usize;
+        for idx in 0..zim.header.cluster_count {
+            let cluster = zim
+                .get_cluster(idx)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let guard = cluster
+                .read()
+                .unwrap_or_else(|e| panic!("{name} cluster {idx}: {e}"));
+
+            for blob in 0..guard.blob_count() as u32 {
+                bytes += guard
+                    .blob(blob)
+                    .unwrap_or_else(|e| panic!("{name} cluster {idx} blob {blob}: {e}"))
+                    .len();
+            }
+            blobs += guard.blob_count();
+
+            // One past the last blob is the offset table's end sentinel, not a blob.
+            assert!(guard.blob(guard.blob_count() as u32).is_err(), "{name}");
+        }
+
+        assert_eq!(blobs, total, "{name}");
+        assert!(bytes > 0, "{name}");
+    }
+}
+
+/// The MIME list sits immediately after the header, so `mimeListPos` is the header size and is
+/// always 80. Accepting any other value reads the list out of the middle of another structure and
+/// yields plausible but wrong types for every entry, which is far worse than refusing the file.
+#[test]
+fn mime_list_pos_is_pinned_to_the_header_size() {
+    let original = std::fs::read(fixture(V61)).expect("failed to read fixture");
+    let dir: PathBuf = testdir!();
+
+    for pos in [0u64, 72, 79, 81, 96, 255] {
+        let mut corrupt = original.clone();
+        corrupt[56..64].copy_from_slice(&pos.to_le_bytes());
+
+        let path = dir.join(format!("mimelistpos-{pos}.zim"));
+        std::fs::write(&path, &corrupt).unwrap();
+
+        assert!(
+            matches!(Zim::new(&path), Err(Error::InvalidHeader(_))),
+            "mimeListPos {pos} should be rejected"
+        );
+    }
+}
+
+/// Truncated files, empty files, and valid magic over a garbage body must all be refused rather
+/// than opened or panicked on.
+#[test]
+fn garbage_input_is_refused() {
+    let dir: PathBuf = testdir!();
+    let magic = 72_173_914u32.to_le_bytes();
+
+    for with_magic in [false, true] {
+        for fill in [0x00u8, 0x01, 0x11, 0x30, 0xff] {
+            for len in [0usize, 4, 8, 40, 79, 80, 88, 200] {
+                let mut raw = vec![fill; len];
+                if with_magic && len >= 4 {
+                    raw[..4].copy_from_slice(&magic);
+                }
+
+                let path = dir.join(format!("garbage-{with_magic}-{fill}-{len}.zim"));
+                std::fs::write(&path, &raw).unwrap();
+
+                assert!(
+                    Zim::new(&path).is_err(),
+                    "magic={with_magic} fill={fill:#x} len={len} should be refused"
+                );
+            }
+        }
+    }
+}
+
+/// A failing checksum must not stop an archive being read. libzim treats verification as a
+/// separate step, and refusing to open would make us reject archives it reads happily.
+#[test]
+fn a_bad_checksum_does_not_prevent_reading() {
+    let mut raw = std::fs::read(fixture(V63)).expect("failed to read fixture");
+    let len = raw.len();
+    raw[len - 8] ^= 0xff; // inside the trailing MD5
+
+    let dir: PathBuf = testdir!();
+    let path = dir.join("bad-checksum.zim");
+    std::fs::write(&path, &raw).unwrap();
+
+    let zim = Zim::new(&path).expect("a bad checksum must not prevent opening");
+    assert!(matches!(zim.verify_checksum(), Err(Error::InvalidChecksum)));
+
+    // and the content is still fully readable
+    let entries = zim.iterate_by_urls().collect::<Result<Vec<_>>>().unwrap();
+    assert_eq!(entries.len(), zim.header.article_count as usize);
+    assert!(zim.main_page().unwrap().is_some());
 }

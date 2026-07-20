@@ -355,4 +355,49 @@ mod tests {
         raw.extend_from_slice(&16u32.to_le_bytes()); // goes backwards
         assert!(parse_blob_list(Cursor::new(raw.as_slice()), false).is_err());
     }
+
+    /// Extended clusters use 64-bit offsets, so nothing about them is exercised by an archive
+    /// built from 32-bit ones. A swapped bit position in `parse_details`, or a u32/u64 mix-up in
+    /// the offset reader, would silently misparse every offset rather than error.
+    #[test]
+    fn parses_extended_clusters() {
+        // Fifth bit marks extended; the low nibble is the compression.
+        assert_eq!(parse_details(&0x01).unwrap(), (false, Compression::None));
+        assert_eq!(parse_details(&0x11).unwrap(), (true, Compression::None));
+        assert_eq!(parse_details(&0x05).unwrap(), (false, Compression::Zstd));
+        assert_eq!(parse_details(&0x15).unwrap(), (true, Compression::Zstd));
+        assert_eq!(parse_details(&0x14).unwrap(), (true, Compression::Lzma2));
+
+        // A table of three 64-bit offsets: two blobs plus the end sentinel.
+        let mut raw = Vec::new();
+        for offset in [24u64, 27, 31] {
+            raw.extend_from_slice(&offset.to_le_bytes());
+        }
+        let list = parse_blob_list(Cursor::new(raw.as_slice()), true).unwrap();
+        assert_eq!(list, vec![24, 27, 31]);
+
+        // The same validation applies, against the wider offset size.
+        for bad in [0u64, 4, 7, 12, 20] {
+            assert!(
+                parse_blob_list(Cursor::new(bad.to_le_bytes()), true).is_err(),
+                "extended first offset {bad} should be rejected"
+            );
+        }
+        // Exactly one offset is a legal zero-blob cluster.
+        assert_eq!(
+            parse_blob_list(Cursor::new(8u64.to_le_bytes()), true).unwrap(),
+            vec![8]
+        );
+    }
+
+    /// A first offset near `u32::MAX` implies hundreds of millions of entries. It must be
+    /// rejected by reading, not by allocating - the parser deliberately does not pre-allocate
+    /// from a count that came off disk.
+    #[test]
+    fn blob_list_rejects_an_absurd_first_offset() {
+        assert!(parse_blob_list(Cursor::new(0xFFFF_FFF0u32.to_le_bytes()), false).is_err());
+        assert!(
+            parse_blob_list(Cursor::new(0xFFFF_FFFF_FFFF_FFF8u64.to_le_bytes()), true).is_err()
+        );
+    }
 }
