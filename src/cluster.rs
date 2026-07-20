@@ -101,9 +101,11 @@ impl<'a> Cluster<'a> {
         self.0.read().unwrap().compression
     }
 
-    /// Whether the cluster's data has been loaded yet.
-    #[cfg(test)]
-    pub(crate) fn is_loaded(&self) -> bool {
+    /// Whether the cluster's data has been read yet.
+    ///
+    /// A cluster is loaded on first blob access, so this reports whether that has happened -
+    /// useful for confirming that merely inspecting a cluster did not pull it into memory.
+    pub fn is_loaded(&self) -> bool {
         self.0.read().unwrap().blob_list.is_some()
     }
 

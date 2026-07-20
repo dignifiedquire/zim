@@ -17,7 +17,7 @@ mod target;
 mod uuid;
 mod zim;
 
-pub use crate::cluster::{Cluster, ClusterGuard};
+pub use crate::cluster::{Cluster, ClusterGuard, Compression};
 pub use crate::directory_entry::DirectoryEntry;
 pub use crate::errors::{Error, Result};
 pub use crate::mime_type::MimeType;
@@ -25,4 +25,4 @@ pub use crate::namespace::Namespace;
 pub use crate::store::Store;
 pub use crate::target::Target;
 pub use crate::uuid::Uuid;
-pub use crate::zim::{Content, Listing, Zim};
+pub use crate::zim::{Checksum, Content, Listing, Zim, ZimHeader, ZIM_MAGIC_NUMBER};
