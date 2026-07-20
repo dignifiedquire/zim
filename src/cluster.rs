@@ -2,12 +2,10 @@ use std::borrow::Cow;
 use std::fmt;
 use std::io::Cursor;
 use std::io::Read;
-use std::ops::Deref;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard};
 
 use bitreader::BitReader;
 use byteorder::{LittleEndian, ReadBytesExt};
-use ouroboros::self_referencing;
 use xz2::read::XzDecoder;
 
 use crate::errors::{Error, Result};
@@ -108,11 +106,14 @@ impl<'a> Cluster<'a> {
         self.0.read().unwrap().compression
     }
 
-    /// Returns a copy of the blob's bytes.
+    /// Locks the cluster for reading, decompressing it first if necessary.
     ///
-    /// Unlike [`Cluster::get_blob`], the result does not borrow from the cluster, so this can be
-    /// used with a `Cluster` that is dropped straight away.
-    pub fn blob_to_vec(&self, idx: u32) -> Result<Vec<u8>> {
+    /// Blobs are borrowed from the guard rather than copied. A blob can be very large - search
+    /// indexes run to gigabytes on a full archive - so the only allocation is the cluster's own
+    /// decompression buffer, which is computed once and shared by every blob in the cluster.
+    /// Uncompressed clusters, which is where the format requires indexes and listings to live,
+    /// are served straight from the mapping and allocate nothing at all.
+    pub fn read(&self) -> Result<ClusterGuard<'_, 'a>> {
         {
             let lock = self.0.read().unwrap();
             if lock.needs_decompression() {
@@ -121,46 +122,22 @@ impl<'a> Cluster<'a> {
             }
         }
 
-        let guard = self.0.read().unwrap();
-        Ok(guard.get_blob(idx)?.to_vec())
-    }
-
-    pub fn get_blob<'b: 'a>(&'b self, idx: u32) -> Result<Blob<'a, 'b>> {
-        {
-            let lock = self.0.read().unwrap();
-            if lock.needs_decompression() {
-                drop(lock);
-                self.0.write().unwrap().decompress()?;
-            }
-        }
-
-        let blob = BlobTryBuilder {
-            guard: self.0.read().unwrap(),
-            slice_builder: |guard| guard.get_blob(idx),
-        }
-        .try_build()?;
-
-        Ok(blob)
+        Ok(ClusterGuard(self.0.read().unwrap()))
     }
 }
 
-#[self_referencing]
-pub struct Blob<'a, 'b: 'a> {
-    guard: std::sync::RwLockReadGuard<'b, InnerCluster<'a>>,
-    #[borrows(guard)]
-    slice: &'this [u8],
-}
+/// Read access to a cluster's blobs.
+pub struct ClusterGuard<'g, 'a>(RwLockReadGuard<'g, InnerCluster<'a>>);
 
-impl<'a, 'b: 'a> Deref for Blob<'a, 'b> {
-    type Target = [u8];
-    fn deref(&self) -> &Self::Target {
-        self.borrow_slice()
+impl<'g, 'a> ClusterGuard<'g, 'a> {
+    /// Returns a blob's bytes, borrowed from the archive or from the decompression buffer.
+    pub fn blob(&self, idx: u32) -> Result<&[u8]> {
+        self.0.get_blob(idx)
     }
-}
 
-impl<'a, 'b: 'a> AsRef<[u8]> for Blob<'a, 'b> {
-    fn as_ref(&self) -> &[u8] {
-        self.borrow_slice()
+    /// Number of blobs in the cluster.
+    pub fn blob_count(&self) -> usize {
+        self.0.blob_count()
     }
 }
 
@@ -253,6 +230,14 @@ impl<'a> InnerCluster<'a> {
         }
 
         Ok(())
+    }
+
+    /// The offset table carries one entry more than there are blobs, the last being the end of
+    /// the data area.
+    fn blob_count(&self) -> usize {
+        self.blob_list
+            .as_ref()
+            .map_or(0, |list| list.len().saturating_sub(1))
     }
 
     fn get_blob(&self, idx: u32) -> Result<&[u8]> {

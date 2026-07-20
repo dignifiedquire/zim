@@ -81,20 +81,19 @@ fn main() -> Result<()> {
     };
     println!("Main page: \"{}\"", main_page);
 
+    let mut listings = Vec::new();
+    if let Some(entries) = zim_file.entry_list_by_title()? {
+        listings.push(format!("{} entries (v0)", entries.len()?));
+    }
+    if let Some(articles) = zim_file.article_list_by_title()? {
+        listings.push(format!("{} articles (v1)", articles.len()?));
+    }
     println!(
         "Title listing: {}",
-        match (
-            zim_file.entry_list_by_title()?,
-            zim_file.article_list_by_title()?,
-        ) {
-            (Some(entries), Some(articles)) => format!(
-                "{} entries (v0), {} articles (v1)",
-                entries.len(),
-                articles.len()
-            ),
-            (Some(entries), None) => format!("{} entries (v0)", entries.len()),
-            (None, Some(articles)) => format!("{} articles (v1)", articles.len()),
-            (None, None) => "-".into(),
+        if listings.is_empty() {
+            "-".to_string()
+        } else {
+            listings.join(", ")
         }
     );
 
@@ -116,10 +115,10 @@ fn main() -> Result<()> {
     for key in zim_file.metadata_keys()? {
         match zim_file.metadata(&key)? {
             // Metadata is text apart from the illustrations, so only print what renders.
-            Some(value) => match String::from_utf8(value) {
+            Some(value) => value.with(|bytes| match std::str::from_utf8(bytes) {
                 Ok(text) => println!("  {}: {}", key, text),
-                Err(err) => println!("  {}: <{} bytes>", key, err.as_bytes().len()),
-            },
+                Err(_) => println!("  {}: <{} bytes>", key, bytes.len()),
+            })?,
             None => println!("  {}: -", key),
         }
     }

@@ -169,13 +169,14 @@ fn process_file<'a>(
         Some(Target::Cluster(cluster_index, blob_idx)) => {
             let cluster = cluster_map.get(cluster_index).expect("missing cluster");
 
-            match cluster.get_blob(*blob_idx) {
-                Ok(blob) => {
-                    safe_write(&dst, blob, 1);
-                }
-                Err(err) => {
-                    eprintln!("skipping invalid blob: {}: {}", dst.display(), err);
-                }
+            // The blob is borrowed from the cluster rather than copied out; blobs can be very
+            // large, and the cluster's decompressed buffer is shared by all of them.
+            let written = cluster
+                .read()
+                .and_then(|guard| guard.blob(*blob_idx).map(|blob| safe_write(&dst, blob, 1)));
+
+            if let Err(err) = written {
+                eprintln!("skipping invalid blob: {}: {}", dst.display(), err);
             }
             pb.inc(1);
         }

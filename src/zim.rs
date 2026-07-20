@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::io::BufRead;
 use std::io::Cursor;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use byteorder::{LittleEndian, ReadBytesExt};
@@ -72,6 +73,99 @@ pub struct Zim {
 }
 
 pub type Checksum = Array<u8, <Md5 as OutputSizeUser>::OutputSize>;
+
+/// A handle to an entry's content.
+///
+/// Nothing is read until the handle is used, and the bytes are then borrowed rather than copied.
+/// This matters because blobs are not small: a search index runs to gigabytes on a full archive,
+/// and the format stores indexes and listings uncompressed, so they are served directly from the
+/// mapping. Decompressed clusters are decompressed once and cached, and every blob in the cluster
+/// then borrows from that one buffer.
+///
+/// Use [`Content::with`] or [`Content::write_to`] to avoid copying; [`Content::to_vec`] opts into
+/// an allocation explicitly.
+pub struct Content<'a> {
+    cluster: Cluster<'a>,
+    blob: u32,
+}
+
+impl<'a> Content<'a> {
+    /// Calls `f` with the content's bytes, without copying them.
+    pub fn with<T>(&self, f: impl FnOnce(&[u8]) -> T) -> Result<T> {
+        let guard = self.cluster.read()?;
+
+        Ok(f(guard.blob(self.blob)?))
+    }
+
+    /// Size of the content in bytes.
+    pub fn len(&self) -> Result<usize> {
+        self.with(<[u8]>::len)
+    }
+
+    pub fn is_empty(&self) -> Result<bool> {
+        Ok(self.len()? == 0)
+    }
+
+    /// Writes the content out without copying it first.
+    pub fn write_to(&self, out: &mut impl std::io::Write) -> Result<()> {
+        self.with(|bytes| out.write_all(bytes))??;
+
+        Ok(())
+    }
+
+    /// Copies the content into a new `Vec`.
+    ///
+    /// Prefer [`Content::with`] or [`Content::write_to`] where the copy can be avoided.
+    pub fn to_vec(&self) -> Result<Vec<u8>> {
+        self.with(<[u8]>::to_vec)
+    }
+}
+
+/// A list of entry indices stored as an archive entry.
+///
+/// Listings are one `u32` per article, so a full archive's listing is tens of megabytes. The
+/// indices are decoded on demand rather than up front.
+pub struct Listing<'a> {
+    content: Content<'a>,
+}
+
+impl<'a> Listing<'a> {
+    /// Number of indices in the listing.
+    pub fn len(&self) -> Result<usize> {
+        Ok(self.content.len()? / 4)
+    }
+
+    pub fn is_empty(&self) -> Result<bool> {
+        Ok(self.len()? == 0)
+    }
+
+    /// The entry index at `pos`.
+    pub fn get(&self, pos: usize) -> Result<Option<u32>> {
+        self.content.with(|raw| {
+            raw.get(pos * 4..pos * 4 + 4)
+                .map(|raw| u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
+        })
+    }
+
+    /// Calls `f` with each entry index, in order.
+    pub fn for_each(&self, mut f: impl FnMut(u32)) -> Result<()> {
+        self.content.with(|raw| {
+            for raw in raw.chunks_exact(4) {
+                f(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]));
+            }
+        })
+    }
+
+    /// Copies the listing into a `Vec`.
+    ///
+    /// Prefer [`Listing::for_each`] on large archives.
+    pub fn to_vec(&self) -> Result<Vec<u32>> {
+        let mut out = Vec::with_capacity(self.len()?);
+        self.for_each(|idx| out.push(idx))?;
+
+        Ok(out)
+    }
+}
 
 /// A ZIM file starts with a header.
 #[derive(Debug)]
@@ -244,7 +338,7 @@ impl Zim {
     /// Note that in the new namespace scheme (format version 6.1 and later) the stored path does
     /// not include the namespace, which is why it is passed separately.
     pub fn find_by_path(&self, namespace: Namespace, path: &str) -> Result<Option<u32>> {
-        let idx = self.lower_bound(namespace, path)?;
+        let idx = self.lower_bound(namespace.as_byte(), path)?;
 
         if (idx as usize) < self.url_list.len() {
             let entry = self.get_by_url_index(idx)?;
@@ -257,8 +351,8 @@ impl Zim {
     }
 
     /// Index of the first entry that is not ordered before `namespace`/`path`.
-    fn lower_bound(&self, namespace: Namespace, path: &str) -> Result<u32> {
-        let target = (namespace.as_byte(), path.as_bytes());
+    fn lower_bound(&self, namespace: u8, path: &str) -> Result<u32> {
+        let target = (namespace, path.as_bytes());
 
         let mut low = 0usize;
         let mut high = self.url_list.len();
@@ -284,30 +378,30 @@ impl Zim {
         }
     }
 
-    /// Returns the paths of every entry in `namespace`, in order.
-    pub fn paths_in_namespace(&self, namespace: Namespace) -> Result<Vec<String>> {
-        let start = self.lower_bound(namespace, "")?;
+    /// The range of entry indices belonging to `namespace`.
+    ///
+    /// Both ends are located by binary search, so the entries in between are never touched.
+    pub fn namespace_range(&self, namespace: Namespace) -> Result<Range<u32>> {
+        let start = self.lower_bound(namespace.as_byte(), "")?;
+        let end = match namespace.as_byte().checked_add(1) {
+            Some(next) => self.lower_bound(next, "")?,
+            None => self.url_list.len() as u32,
+        };
 
-        let mut out = Vec::new();
-        for idx in start..self.url_list.len() as u32 {
-            let entry = self.get_by_url_index(idx)?;
-            if entry.namespace != namespace {
-                break;
-            }
-            out.push(entry.url);
-        }
-
-        Ok(out)
+        Ok(start..end)
     }
 
-    /// Returns the contents of an entry, or `None` if it does not store any (a redirect, or one
+    /// Returns a handle to an entry's content, or `None` if it stores none (a redirect, or one
     /// of the deprecated linktarget/deleted entries).
-    pub fn entry_data(&self, entry: &DirectoryEntry) -> Result<Option<Vec<u8>>> {
+    ///
+    /// The bytes are not touched until the handle is used, and are then borrowed rather than
+    /// copied - see [`Content`].
+    pub fn entry_content(&self, entry: &DirectoryEntry) -> Result<Option<Content<'_>>> {
         match entry.target {
-            Some(Target::Cluster(cluster_idx, blob_idx)) => {
-                let cluster = self.get_cluster(cluster_idx)?;
-                Ok(Some(cluster.blob_to_vec(blob_idx)?))
-            }
+            Some(Target::Cluster(cluster_idx, blob_idx)) => Ok(Some(Content {
+                cluster: self.get_cluster(cluster_idx)?,
+                blob: blob_idx,
+            })),
             _ => Ok(None),
         }
     }
@@ -348,73 +442,71 @@ impl Zim {
         }
     }
 
-    /// Returns the contents of the named metadata entry, e.g. `Title` or `Language`.
-    pub fn metadata(&self, name: &str) -> Result<Option<Vec<u8>>> {
+    /// Returns the named metadata entry, e.g. `Title` or `Language`.
+    pub fn metadata(&self, name: &str) -> Result<Option<Content<'_>>> {
         match self.get_by_path(Namespace::Metadata, name)? {
-            Some(entry) => self.entry_data(&entry),
+            Some(entry) => self.entry_content(&entry),
             None => Ok(None),
         }
     }
 
     /// Returns the names of every metadata entry present.
-    pub fn metadata_keys(&self) -> Result<Vec<String>> {
-        self.paths_in_namespace(Namespace::Metadata)
-    }
-
-    /// Returns every entry ordered by title, as indices into the path pointer list.
     ///
-    /// Prefers the `X/listing/titleOrdered/v0` entry and falls back to the deprecated title
-    /// pointer list, as the spec directs. Format version 6.3 removed both, carrying only the
-    /// article listing, so this returns `None` for such archives - use
-    /// [`Zim::article_list_by_title`] instead.
-    pub fn entry_list_by_title(&self) -> Result<Option<Vec<u32>>> {
-        if let Some(listing) = self.listing(LISTING_TITLE_ORDERED_V0)? {
-            return Ok(Some(listing));
-        }
-
-        Ok(self.article_list.clone())
+    /// The metadata namespace holds on the order of a dozen entries, so unlike the content
+    /// namespace it is reasonable to collect.
+    pub fn metadata_keys(&self) -> Result<Vec<String>> {
+        self.namespace_range(Namespace::Metadata)?
+            .map(|idx| Ok(self.get_by_url_index(idx)?.url))
+            .collect()
     }
 
-    /// Returns the archive's article entries ordered by title, as indices into the path pointer
-    /// list.
+    /// Returns every entry ordered by title, from the `X/listing/titleOrdered/v0` entry.
+    ///
+    /// Format version 6.3 removed this listing, so it returns `None` there - use
+    /// [`Zim::article_list_by_title`] instead. Archives predating the listing carry the same
+    /// content in the deprecated [`Zim::article_list`] field, which the spec names as the
+    /// fallback.
+    pub fn entry_list_by_title(&self) -> Result<Option<Listing<'_>>> {
+        self.listing(LISTING_TITLE_ORDERED_V0)
+    }
+
+    /// Returns the archive's article entries ordered by title.
     ///
     /// This is the `X/listing/titleOrdered/v1` entry added in format version 6.1. Unlike
     /// [`Zim::entry_list_by_title`] it covers only article entries, so it is what you want in
     /// order to list or sample articles without resources mixed in.
-    pub fn article_list_by_title(&self) -> Result<Option<Vec<u32>>> {
+    pub fn article_list_by_title(&self) -> Result<Option<Listing<'_>>> {
         self.listing(LISTING_TITLE_ORDERED_V1)
     }
 
-    /// Returns the raw Xapian fulltext index, to be opened with a Xapian implementation.
-    pub fn fulltext_index(&self) -> Result<Option<Vec<u8>>> {
+    /// Returns the Xapian fulltext index, to be opened with a Xapian implementation.
+    ///
+    /// This index is the largest thing in a typical archive - gigabytes on a full Wikipedia - so
+    /// the handle borrows it rather than reading it into memory.
+    pub fn fulltext_index(&self) -> Result<Option<Content<'_>>> {
         self.index_entry(XAPIAN_FULLTEXT)
     }
 
-    /// Returns the raw Xapian title index, to be opened with a Xapian implementation.
-    pub fn title_index(&self) -> Result<Option<Vec<u8>>> {
+    /// Returns the Xapian title index, to be opened with a Xapian implementation.
+    pub fn title_index(&self) -> Result<Option<Content<'_>>> {
         self.index_entry(XAPIAN_TITLE)
     }
 
-    /// Reads a listing entry from the `X` namespace as a list of entry indices.
-    fn listing(&self, path: &str) -> Result<Option<Vec<u32>>> {
-        let Some(data) = self.index_entry(path)? else {
+    fn listing(&self, path: &str) -> Result<Option<Listing<'_>>> {
+        let Some(content) = self.index_entry(path)? else {
             return Ok(None);
         };
 
-        if data.len() % 4 != 0 {
+        if content.len()? % 4 != 0 {
             return Err(Error::InvalidListing);
         }
 
-        Ok(Some(
-            data.chunks_exact(4)
-                .map(|raw| u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
-                .collect(),
-        ))
+        Ok(Some(Listing { content }))
     }
 
-    fn index_entry(&self, path: &str) -> Result<Option<Vec<u8>>> {
+    fn index_entry(&self, path: &str) -> Result<Option<Content<'_>>> {
         match self.get_by_path(Namespace::FulltextIndex, path)? {
-            Some(entry) => self.entry_data(&entry),
+            Some(entry) => self.entry_content(&entry),
             None => Ok(None),
         }
     }
@@ -610,6 +702,14 @@ mod tests {
 
     use super::*;
 
+    /// Copies a blob out, for comparing against expected bytes.
+    fn blob(zim: &Zim, cluster: u32, idx: u32) -> Vec<u8> {
+        let cluster = zim.get_cluster(cluster).unwrap();
+        let guard = cluster.read().unwrap();
+
+        guard.blob(idx).unwrap().to_vec()
+    }
+
     #[ignore]
     #[test]
     fn test_zim_ab_all_2017_03() {
@@ -617,11 +717,9 @@ mod tests {
             Zim::new("fixtures/wikipedia_ab_all_2017-03.zim").expect("failed to parse fixture");
 
         assert_eq!(zim.header.version_major, 5);
-        let cl0 = zim.get_cluster(0).unwrap();
-        assert_eq!(&cl0.get_blob(0).unwrap()[..], &[97, 98, 107][..]);
+        assert_eq!(blob(&zim, 0, 0), &[97, 98, 107][..]);
 
-        let cl1 = zim.get_cluster(zim.header.cluster_count - 1).unwrap();
-        let b = cl1.get_blob(0).unwrap();
+        let b = blob(&zim, zim.header.cluster_count - 1, 0);
         assert_eq!(&b[0..10], &[71, 73, 70, 56, 57, 97, 44, 1, 150, 0]);
         assert_eq!(
             &b[b.len() - 10..],
@@ -641,15 +739,13 @@ mod tests {
         assert_eq!(zim.header.version_major, 5);
         assert_eq!(zim.header.article_count, 9890);
 
-        let cl0 = zim.get_cluster(0).unwrap();
         assert_eq!(
-            &cl0.get_blob(0).unwrap()[..],
+            blob(&zim, 0, 0),
             &[50, 48, 50, 50, 45, 48, 53, 45, 49, 52][..]
         );
-        assert_eq!(cl0.compression(), Compression::Zstd);
+        assert_eq!(zim.get_cluster(0).unwrap().compression(), Compression::Zstd);
 
-        let cl1 = zim.get_cluster(zim.header.cluster_count - 1).unwrap();
-        let b = cl1.get_blob(0).unwrap();
+        let b = blob(&zim, zim.header.cluster_count - 1, 0);
         assert_eq!(&b[0..10], &[15, 13, 88, 97, 112, 105, 97, 110, 32, 71]);
         assert_eq!(
             &b[b.len() - 10..],
@@ -668,18 +764,16 @@ mod tests {
         assert_eq!(zim.header.version_major, 6);
         assert_eq!(zim.header.article_count, 19);
 
-        let cl0 = zim.get_cluster(0).unwrap();
         assert_eq!(
-            &cl0.get_blob(0).unwrap()[..],
+            blob(&zim, 0, 0),
             &[
                 115, 112, 101, 101, 100, 116, 101, 115, 116, 95, 101, 110, 95, 98, 108, 111, 98,
                 45, 109, 105, 110, 105
             ][..]
         );
-        assert_eq!(cl0.compression(), Compression::Zstd);
+        assert_eq!(zim.get_cluster(0).unwrap().compression(), Compression::Zstd);
 
-        let cl1 = zim.get_cluster(zim.header.cluster_count - 1).unwrap();
-        let b = cl1.get_blob(0).unwrap();
+        let b = blob(&zim, zim.header.cluster_count - 1, 0);
         assert_eq!(&b[0..10], &[137, 80, 78, 71, 13, 10, 26, 10, 0, 0]);
         assert_eq!(
             &b[b.len() - 10..],
@@ -695,7 +789,10 @@ mod tests {
         zim.iterate_by_urls()
             .map(|entry| {
                 let entry = entry.expect("entry must parse");
-                let data = zim.entry_data(&entry).expect("entry data must read");
+                let data = zim
+                    .entry_content(&entry)
+                    .expect("entry content must resolve")
+                    .map(|content| content.to_vec().expect("entry data must read"));
 
                 (
                     format!("{:?}", entry.namespace),
@@ -830,7 +927,12 @@ mod tests {
         let zim =
             Zim::new("fixtures/wikipedia_en_100_2026-04.zim").expect("failed to parse fixture");
 
-        let title = zim.metadata("Title").unwrap().expect("Title is mandatory");
+        let title = zim
+            .metadata("Title")
+            .unwrap()
+            .expect("Title is mandatory")
+            .to_vec()
+            .unwrap();
         assert_eq!(String::from_utf8(title).unwrap(), "Wikipedia 100");
 
         assert!(zim.metadata("NoSuchMetadataEntry").unwrap().is_none());
@@ -854,12 +956,44 @@ mod tests {
         let zim =
             Zim::new("fixtures/wikipedia_en_100_2026-04.zim").expect("failed to parse fixture");
 
-        assert!(!zim
-            .fulltext_index()
-            .unwrap()
-            .expect("fulltext index")
-            .is_empty());
-        assert!(!zim.title_index().unwrap().expect("title index").is_empty());
+        // Sizes are read through the handle rather than by loading the index: on a full archive
+        // the fulltext index runs to gigabytes.
+        let fulltext = zim.fulltext_index().unwrap().expect("fulltext index");
+        assert_eq!(fulltext.len().unwrap(), 2_424_832);
+
+        let title = zim.title_index().unwrap().expect("title index");
+        assert_eq!(title.len().unwrap(), 917_504);
+    }
+
+    /// Content from an uncompressed cluster must be borrowed straight from the mapping rather
+    /// than copied. This is what keeps a multi-gigabyte search index from having to be read into
+    /// memory in order to be used, and the format requires indexes and listings to be stored
+    /// uncompressed precisely so that this is possible.
+    #[test]
+    fn index_content_is_borrowed_from_the_mapping() {
+        let zim =
+            Zim::new("fixtures/wikipedia_en_100_2026-04.zim").expect("failed to parse fixture");
+
+        for content in [
+            zim.fulltext_index().unwrap().expect("fulltext index"),
+            zim.title_index().unwrap().expect("title index"),
+        ] {
+            let borrowed = content
+                .with(|bytes| {
+                    let start = bytes.as_ptr() as usize;
+
+                    zim.store
+                        .prefix_chunks(zim.store.len())
+                        .iter()
+                        .any(|chunk| {
+                            let low = chunk.as_ptr() as usize;
+                            start >= low && start < low + chunk.len()
+                        })
+                })
+                .unwrap();
+
+            assert!(borrowed, "content must point into the mapping, not a copy");
+        }
     }
 
     /// Version 6.3 removed both the header's title pointer list and the `v0` listing, leaving
@@ -883,24 +1017,24 @@ mod tests {
             .article_list_by_title()
             .unwrap()
             .expect("6.3 archives carry the v1 listing");
-        assert!(!articles.is_empty());
-        assert!(articles.len() < v63.header.article_count as usize);
+        assert!(!articles.is_empty().unwrap());
+        assert!(articles.len().unwrap() < v63.header.article_count as usize);
 
         // The listing must decode to real indices, in title order - a wrong element width or
         // endianness would still produce a plausible-looking list of numbers.
-        let titles: Vec<String> = articles
-            .iter()
-            .map(|&idx| {
+        let mut titles: Vec<String> = Vec::new();
+        articles
+            .for_each(|idx| {
                 let entry = v63
                     .get_by_url_index(idx)
                     .expect("listing index must be valid");
-                if entry.title.is_empty() {
+                titles.push(if entry.title.is_empty() {
                     entry.url
                 } else {
                     entry.title
-                }
+                });
             })
-            .collect();
+            .unwrap();
         assert!(
             titles.windows(2).all(|pair| pair[0] <= pair[1]),
             "v1 listing is not in title order"
@@ -1056,17 +1190,15 @@ mod tests {
         assert!(zim.get_cluster(u32::MAX).is_err());
 
         let cluster = zim.get_cluster(0).unwrap();
-        assert!(cluster.get_blob(u32::MAX).is_err());
+        let guard = cluster.read().unwrap();
+        assert!(guard.blob(u32::MAX).is_err());
 
-        // Probe upwards for the first rejected blob index. The offset table carries one entry
-        // more than there are blobs, and treating that end sentinel as a blob used to hand back
-        // a bogus slice instead of erroring.
-        let mut blobs = 0u32;
-        while cluster.get_blob(blobs).is_ok() {
-            blobs += 1;
-            assert!(blobs < 10_000, "blob index probe failed to terminate");
-        }
-        assert!(blobs > 0, "cluster 0 should contain at least one blob");
+        // The offset table carries one entry more than there are blobs. Treating that end
+        // sentinel as a blob used to hand back a bogus slice instead of erroring.
+        let count = guard.blob_count() as u32;
+        assert!(count > 0, "cluster 0 should contain at least one blob");
+        assert!(guard.blob(count - 1).is_ok(), "last blob must be readable");
+        assert!(guard.blob(count).is_err(), "the end sentinel is not a blob");
     }
 
     #[test]
@@ -1077,15 +1209,13 @@ mod tests {
         assert_eq!(zim.header.version_major, 6);
         assert_eq!(zim.header.article_count, 9061);
 
-        let cl0 = zim.get_cluster(0).unwrap();
         assert_eq!(
-            &cl0.get_blob(0).unwrap()[..],
+            blob(&zim, 0, 0),
             &[87, 105, 107, 105, 112, 101, 100, 105, 97][..]
         );
-        assert_eq!(cl0.compression(), Compression::Zstd);
+        assert_eq!(zim.get_cluster(0).unwrap().compression(), Compression::Zstd);
 
-        let cl1 = zim.get_cluster(zim.header.cluster_count - 1).unwrap();
-        let b = cl1.get_blob(0).unwrap();
+        let b = blob(&zim, zim.header.cluster_count - 1, 0);
         assert_eq!(&b[0..10], &[15, 13, 88, 97, 112, 105, 97, 110, 32, 71]);
         assert_eq!(
             &b[b.len() - 10..],
