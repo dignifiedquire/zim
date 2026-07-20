@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt;
 use std::io::Cursor;
 use std::io::Read;
@@ -6,11 +7,11 @@ use std::sync::{Arc, RwLock};
 
 use bitreader::BitReader;
 use byteorder::{LittleEndian, ReadBytesExt};
-use memmap::Mmap;
 use ouroboros::self_referencing;
 use xz2::read::XzDecoder;
 
 use crate::errors::{Error, Result};
+use crate::store::Store;
 
 /// The compression applied to a cluster's payload.
 ///
@@ -56,7 +57,9 @@ pub struct InnerCluster<'a> {
     start: u64,
     end: u64,
     size: u64,
-    view: &'a [u8],
+    /// The cluster's bytes. Borrowed from the mapping unless the cluster straddles a chunk
+    /// boundary, which the format is not supposed to allow but which costs nothing to support.
+    view: Cow<'a, [u8]>,
     blob_list: Option<Vec<u64>>, // offsets into data
     decompressed: Option<Vec<u8>>,
 }
@@ -82,14 +85,14 @@ impl<'a> fmt::Debug for Cluster<'a> {
 
 impl<'a> Cluster<'a> {
     pub fn new(
-        master_view: &'a Mmap,
+        store: &'a Store,
         cluster_list: &'a [u64],
         idx: u32,
         checksum_pos: u64,
         version: u16,
     ) -> Result<Cluster<'a>> {
         Ok(Cluster(Arc::new(RwLock::new(InnerCluster::new(
-            master_view,
+            store,
             cluster_list,
             idx,
             checksum_pos,
@@ -163,7 +166,7 @@ impl<'a, 'b: 'a> AsRef<[u8]> for Blob<'a, 'b> {
 
 impl<'a> InnerCluster<'a> {
     fn new(
-        master_view: &'a Mmap,
+        store: &'a Store,
         cluster_list: &'a [u64],
         idx: u32,
         checksum_pos: u64,
@@ -181,9 +184,7 @@ impl<'a> InnerCluster<'a> {
             return Err(Error::OutOfBounds);
         }
         let cluster_size = end - start;
-        let cluster_view = master_view
-            .get(usize::try_from(start)?..usize::try_from(end)?)
-            .ok_or(Error::OutOfBounds)?;
+        let cluster_view = store.slice(start, cluster_size)?;
 
         let (extended, compression) =
             parse_details(cluster_view.first().ok_or(Error::OutOfBounds)?)?;

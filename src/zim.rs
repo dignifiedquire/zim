@@ -1,12 +1,11 @@
+use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::fs::File;
+use std::io::BufRead;
 use std::io::Cursor;
-use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use byteorder::{LittleEndian, ReadBytesExt};
 use md5::{digest::array::Array, digest::OutputSizeUser, Digest, Md5};
-use memmap::Mmap;
 
 use crate::cluster::Cluster;
 use crate::directory_entry::DirectoryEntry;
@@ -14,6 +13,7 @@ use crate::directory_iterator::DirectoryIterator;
 use crate::errors::{Error, Result};
 use crate::mime_type::MimeType;
 use crate::namespace::Namespace;
+use crate::store::Store;
 use crate::target::Target;
 use crate::uuid::Uuid;
 
@@ -41,14 +41,24 @@ const XAPIAN_TITLE: &str = "title/xapian";
 /// A redirect may point at another redirect, but a chain this long is a loop.
 const MAX_REDIRECT_HOPS: usize = 50;
 
+/// How much of the archive a single directory entry may occupy.
+///
+/// An entry's length is only known once its path and title have been parsed, so reading one means
+/// taking a window and parsing within it. Paths and titles are far smaller than this in practice.
+const MAX_DIRENT_SIZE: u64 = 64 * 1024;
+
+/// How far the MIME type list may extend past `mimeListPos`.
+const MAX_MIME_LIST_SIZE: u64 = 64 * 1024;
+
 /// Represents a ZIM file
 #[allow(dead_code)]
 pub struct Zim {
     // Zim structure data:
     pub header: ZimHeader,
 
-    pub master_view: Mmap,
-    /// The path to the file.
+    /// The archive's bytes, spanning its chunk files if it is a split archive.
+    pub store: Store,
+    /// The path the archive was opened from.
     pub file_path: PathBuf,
 
     /// List of mimetypes used in this ZIM archive
@@ -152,27 +162,26 @@ impl Zim {
     /// Loads a Zim file and parses the header, and the url, title, and cluster offset tables.  The
     /// rest of the data isn't parsed until it's needed, so this should be fairly quick.
     pub fn new<P: AsRef<Path>>(p: P) -> Result<Zim> {
-        let f = File::open(p.as_ref())?;
-        let master_view = unsafe { Mmap::map(&f)? };
+        let store = Store::open(p.as_ref())?;
 
-        let (header, mime_table) = parse_header(&master_view)?;
-        let url_list = parse_url_list(&master_view, header.url_ptr_pos, header.article_count)?;
+        let (header, mime_table) = parse_header(&store)?;
+        let url_list = parse_url_list(&store, header.url_ptr_pos, header.article_count)?;
         let article_list = if let Some(title_ptr_pos) = header.title_ptr_pos {
-            let list = parse_article_list(&master_view, title_ptr_pos, header.article_count)?;
+            let list = parse_article_list(&store, title_ptr_pos, header.article_count)?;
             Some(list)
         } else {
             None
         };
 
         let cluster_list =
-            parse_cluster_list(&master_view, header.cluster_ptr_pos, header.cluster_count)?;
+            parse_cluster_list(&store, header.cluster_ptr_pos, header.cluster_count)?;
 
-        let checksum = read_checksum(&master_view, header.checksum_pos)?;
+        let checksum = read_checksum(&store, header.checksum_pos)?;
 
         Ok(Zim {
             header,
             file_path: p.as_ref().into(),
-            master_view,
+            store,
             mime_table,
             url_list,
             article_list,
@@ -184,7 +193,7 @@ impl Zim {
     /// Computes the checksum, and returns an error if it does not match the one in
     /// the file.
     pub fn verify_checksum(&self) -> Result<()> {
-        let checksum_computed = compute_checksum(&self.file_path, self.header.checksum_pos)?;
+        let checksum_computed = compute_checksum(&self.store, self.header.checksum_pos);
 
         if self.checksum != checksum_computed {
             return Err(Error::InvalidChecksum);
@@ -221,12 +230,9 @@ impl Zim {
     /// idx must be between 0 and `article_count`
     pub fn get_by_url_index(&self, idx: u32) -> Result<DirectoryEntry> {
         let entry_offset = *self.url_list.get(idx as usize).ok_or(Error::OutOfBounds)?;
-        let dir_view = self
-            .master_view
-            .get(usize::try_from(entry_offset)?..)
-            .ok_or(Error::OutOfBounds)?;
+        let dir_view = self.store.slice_upto(entry_offset, MAX_DIRENT_SIZE)?;
 
-        DirectoryEntry::new(self, dir_view)
+        DirectoryEntry::new(self, &dir_view)
     }
 
     /// Returns the index of the entry at `namespace`/`path`, if it exists.
@@ -418,7 +424,7 @@ impl Zim {
     /// idx must be between 0 and `cluster_count`
     pub fn get_cluster(&self, idx: u32) -> Result<Cluster<'_>> {
         Cluster::new(
-            &self.master_view,
+            &self.store,
             &self.cluster_list,
             idx,
             self.header.checksum_pos,
@@ -435,13 +441,14 @@ fn is_defined(val: u32) -> Option<u32> {
     }
 }
 
-fn parse_header(master_view: &Mmap) -> Result<(ZimHeader, Vec<String>)> {
-    let file_len = master_view.len() as u64;
+fn parse_header(store: &Store) -> Result<(ZimHeader, Vec<String>)> {
+    let file_len = store.len();
     if file_len < HEADER_SIZE {
         return Err(Error::InvalidHeader("file is smaller than the header"));
     }
 
-    let mut header_cur = Cursor::new(master_view);
+    let fixed = store.slice(0, HEADER_SIZE)?;
+    let mut header_cur = Cursor::new(&fixed[..]);
 
     let magic = header_cur.read_u32::<LittleEndian>()?;
 
@@ -498,10 +505,11 @@ fn parse_header(master_view: &Mmap) -> Result<(ZimHeader, Vec<String>)> {
     };
     header.sanity_check(file_len)?;
 
-    // The MIME type list directly follows the header, so seek to `mime_list_pos` rather than
+    // The MIME type list directly follows the header, so read from `mime_list_pos` rather than
     // assuming the length of the fields read above. A header extended by a future minor version
     // is then skipped instead of being parsed as MIME types.
-    header_cur.set_position(mime_list_pos);
+    let mime_region = store.slice_upto(mime_list_pos, MAX_MIME_LIST_SIZE)?;
+    let mut header_cur = Cursor::new(&mime_region[..]);
 
     let mime_table = {
         let mut mime_table = Vec::new();
@@ -524,21 +532,20 @@ fn parse_header(master_view: &Mmap) -> Result<(ZimHeader, Vec<String>)> {
 /// Returns the `count * width` byte region a pointer list occupies.
 ///
 /// `ptr_pos` and `count` come straight from the header, so the extent is computed with checked
-/// arithmetic - otherwise a large value wraps and the bounds check below passes vacuously.
-fn pointer_list_view(master_view: &Mmap, ptr_pos: u64, count: u32, width: usize) -> Result<&[u8]> {
-    let start = usize::try_from(ptr_pos)?;
-    let len = usize::try_from(count)?
+/// arithmetic - otherwise a large value wraps and the bounds check passes vacuously.
+fn pointer_list_view(store: &Store, ptr_pos: u64, count: u32, width: u64) -> Result<Cow<'_, [u8]>> {
+    let len = u64::from(count)
         .checked_mul(width)
         .ok_or(Error::OutOfBounds)?;
-    let end = start.checked_add(len).ok_or(Error::OutOfBounds)?;
 
-    master_view.get(start..end).ok_or(Error::OutOfBounds)
+    store.slice(ptr_pos, len)
 }
 
 /// Parses the Path Pointer List (called the URL Pointer List before April 2024).
 /// See https://wiki.openzim.org/wiki/ZIM_file_format#Path_Pointer_List_(pathPtrPos)
-fn parse_url_list(master_view: &Mmap, ptr_pos: u64, count: u32) -> Result<Vec<u64>> {
-    let mut cur = Cursor::new(pointer_list_view(master_view, ptr_pos, count, 8)?);
+fn parse_url_list(store: &Store, ptr_pos: u64, count: u32) -> Result<Vec<u64>> {
+    let view = pointer_list_view(store, ptr_pos, count, 8)?;
+    let mut cur = Cursor::new(&view[..]);
 
     let mut out: Vec<u64> = Vec::new();
     for _ in 0..count {
@@ -548,8 +555,9 @@ fn parse_url_list(master_view: &Mmap, ptr_pos: u64, count: u32) -> Result<Vec<u6
     Ok(out)
 }
 
-fn parse_article_list(master_view: &Mmap, ptr_pos: u64, count: u32) -> Result<Vec<u32>> {
-    let mut cur = Cursor::new(pointer_list_view(master_view, ptr_pos, count, 4)?);
+fn parse_article_list(store: &Store, ptr_pos: u64, count: u32) -> Result<Vec<u32>> {
+    let view = pointer_list_view(store, ptr_pos, count, 4)?;
+    let mut cur = Cursor::new(&view[..]);
 
     let mut out: Vec<u32> = Vec::new();
     for _ in 0..count {
@@ -559,8 +567,9 @@ fn parse_article_list(master_view: &Mmap, ptr_pos: u64, count: u32) -> Result<Ve
     Ok(out)
 }
 
-fn parse_cluster_list(master_view: &Mmap, ptr_pos: u64, count: u32) -> Result<Vec<u64>> {
-    let mut cluster_cur = Cursor::new(pointer_list_view(master_view, ptr_pos, count, 8)?);
+fn parse_cluster_list(store: &Store, ptr_pos: u64, count: u32) -> Result<Vec<u64>> {
+    let view = pointer_list_view(store, ptr_pos, count, 8)?;
+    let mut cluster_cur = Cursor::new(&view[..]);
 
     let mut out: Vec<u64> = Vec::new();
     for _ in 0..count {
@@ -570,37 +579,29 @@ fn parse_cluster_list(master_view: &Mmap, ptr_pos: u64, count: u32) -> Result<Ve
 }
 
 /// Read out the the 16 byte long MD5 checksum.
-fn read_checksum(master_view: &Mmap, checksum_pos: u64) -> Result<Checksum> {
-    let checksum_pos = usize::try_from(checksum_pos)?;
-    let end = checksum_pos.checked_add(16).ok_or(Error::OutOfBounds)?;
-    match master_view.get(checksum_pos..end) {
-        Some(raw) => {
-            let mut arr = Array::default();
-            arr.copy_from_slice(raw);
+fn read_checksum(store: &Store, checksum_pos: u64) -> Result<Checksum> {
+    let raw = store
+        .slice(checksum_pos, 16)
+        .map_err(|_| Error::MissingChecksum)?;
 
-            Ok(arr)
-        }
-        None => Err(Error::MissingChecksum),
-    }
+    let mut arr = Array::default();
+    arr.copy_from_slice(&raw);
+
+    Ok(arr)
 }
 
-/// Compute the MD5 checksum of the file.
-fn compute_checksum(path: &Path, checksum_pos: u64) -> Result<Checksum> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file.take(checksum_pos));
-    let mut buffer = vec![0u8; 1024];
+/// Compute the MD5 checksum over everything preceding the stored checksum.
+///
+/// For a split archive this spans the chunk files, since the checksum covers the archive as a
+/// whole rather than any one chunk.
+fn compute_checksum(store: &Store, checksum_pos: u64) -> Checksum {
     let mut hasher = Md5::new();
 
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-
-        hasher.update(&buffer[..read]);
+    for chunk in store.prefix_chunks(checksum_pos) {
+        hasher.update(chunk);
     }
 
-    Ok(hasher.finalize())
+    hasher.finalize()
 }
 
 #[cfg(test)]
@@ -687,6 +688,122 @@ mod tests {
 
         let entries = zim.iterate_by_urls().collect::<Result<Vec<_>>>().unwrap();
         assert_eq!(entries.len(), 19);
+    }
+
+    /// Everything an archive exposes, for comparing two ways of opening the same bytes.
+    fn snapshot(zim: &Zim) -> Vec<(String, String, String, Option<Vec<u8>>)> {
+        zim.iterate_by_urls()
+            .map(|entry| {
+                let entry = entry.expect("entry must parse");
+                let data = zim.entry_data(&entry).expect("entry data must read");
+
+                (
+                    format!("{:?}", entry.namespace),
+                    entry.url.clone(),
+                    format!("{:?} {:?} {:?}", entry.title, entry.target, entry.mime_type),
+                    data,
+                )
+            })
+            .collect()
+    }
+
+    /// Writes `raw` out as chunk files named `archive.zimaa`, `archive.zimab`, ... in `dir`, and
+    /// returns the path of the archive as a whole - which deliberately does not exist.
+    fn write_chunks(dir: &std::path::Path, raw: &[u8], chunk_size: usize) -> PathBuf {
+        std::fs::create_dir_all(dir).expect("failed to create chunk dir");
+
+        for (idx, chunk) in raw.chunks(chunk_size).enumerate() {
+            let suffix = format!(
+                "{}{}",
+                (b'a' + (idx / 26) as u8) as char,
+                (b'a' + (idx % 26) as u8) as char
+            );
+            std::fs::write(dir.join(format!("archive.zim{suffix}")), chunk)
+                .expect("failed to write chunk");
+        }
+
+        dir.join("archive.zim")
+    }
+
+    /// A split archive is the concatenation of its chunks, so it must read exactly like the
+    /// whole file - including for structures that straddle a chunk boundary and therefore have
+    /// no contiguous backing to borrow from.
+    #[test]
+    fn reads_a_split_archive_identically_to_the_whole_file() {
+        let source = "fixtures/speedtest_en_blob-mini_2024-05.zim";
+
+        let single = Zim::new(source).expect("failed to parse fixture");
+        single
+            .verify_checksum()
+            .expect("fixture checksum must match");
+        let expected = snapshot(&single);
+
+        let raw = std::fs::read(source).expect("failed to read fixture");
+
+        // Boundaries chosen to land in the directory entries, the clusters, the pointer lists,
+        // and inside the trailing checksum respectively. The 26x26 naming scheme caps the chunk
+        // count at 676, so none of these may be too small.
+        for chunk_size in [10_000, 300_000, raw.len() / 2, 2_064_000, raw.len() - 1] {
+            let dir = std::env::temp_dir().join(format!("zim-split-{chunk_size}"));
+            let _ = std::fs::remove_dir_all(&dir);
+
+            let base = write_chunks(&dir, &raw, chunk_size);
+            assert!(!base.exists(), "the archive itself must not exist");
+
+            let split = Zim::new(&base).expect("failed to open split archive");
+            assert_eq!(
+                split.store.len(),
+                raw.len() as u64,
+                "chunk size {chunk_size}"
+            );
+            assert_eq!(
+                split.header.article_count, single.header.article_count,
+                "chunk size {chunk_size}"
+            );
+
+            let actual = snapshot(&split);
+            assert_eq!(actual.len(), expected.len(), "chunk size {chunk_size}");
+            for (idx, (got, want)) in actual.iter().zip(expected.iter()).enumerate() {
+                assert_eq!(got, want, "chunk size {chunk_size}, entry {idx}");
+            }
+
+            // The checksum covers the archive as a whole, not any single chunk.
+            split
+                .verify_checksum()
+                .unwrap_or_else(|e| panic!("chunk size {chunk_size}: checksum: {e}"));
+
+            // Naming the first chunk must resolve to the same archive.
+            let via_first_chunk =
+                Zim::new(dir.join("archive.zimaa")).expect("failed to open via first chunk");
+            assert_eq!(via_first_chunk.store.len(), raw.len() as u64);
+
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// A whole archive takes precedence over chunks sharing its name, and a chunk sequence stops
+    /// at the first gap rather than skipping over it.
+    #[test]
+    fn chunk_discovery_prefers_the_whole_archive_and_stops_at_a_gap() {
+        let raw = std::fs::read("fixtures/speedtest_en_blob-mini_2024-05.zim")
+            .expect("failed to read fixture");
+
+        let dir = std::env::temp_dir().join("zim-split-discovery");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let base = write_chunks(&dir, &raw, raw.len() / 3);
+
+        // Dropping the second chunk truncates the archive, which must fail the header's
+        // "checksum sits 16 bytes before the end" invariant rather than read short.
+        std::fs::remove_file(dir.join("archive.zimab")).unwrap();
+        assert!(Zim::new(&base).is_err(), "a gap must not be skipped over");
+
+        // With the whole archive present under the same name, the chunks are ignored.
+        std::fs::write(&base, &raw).unwrap();
+        let whole = Zim::new(&base).expect("failed to open whole archive");
+        assert_eq!(whole.store.len(), raw.len() as u64);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

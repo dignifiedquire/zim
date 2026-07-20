@@ -8,6 +8,16 @@
 > cargo build --release
 ```
 
+## Split archives
+
+Archives split into chunks (`data.zimaa`, `data.zimab`, ...) are read transparently. Name either
+the archive or its first chunk:
+
+```sh
+> ./target/release/zim-info data.zim
+> ./target/release/zim-info data.zimaa
+```
+
 ## Usage with IPFS
 
 To add a file `data.zim` to ipfs do the following.
