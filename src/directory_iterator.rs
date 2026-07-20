@@ -1,4 +1,5 @@
 use crate::directory_entry::DirectoryEntry;
+use crate::errors::Result;
 use crate::zim::Zim;
 
 pub struct DirectoryIterator<'a> {
@@ -18,20 +19,21 @@ impl<'a> DirectoryIterator<'a> {
 }
 
 impl<'a> std::iter::Iterator for DirectoryIterator<'a> {
-    type Item = DirectoryEntry;
+    type Item = Result<DirectoryEntry>;
 
+    /// Yields every entry in path order.
+    ///
+    /// A failing entry is reported as `Some(Err(_))` and iteration continues with the next index.
+    /// Entries are addressed through independent pointers, so one unparsable entry says nothing
+    /// about its successors - returning `None` here would silently truncate the archive.
     fn next(&mut self) -> Option<Self::Item> {
         if self.next >= self.max {
             return None;
         }
 
-        let dir_entry_ptr = self.zim.url_list[self.next as usize] as usize;
+        let idx = self.next;
         self.next += 1;
-        let slice = self.zim.master_view.get(dir_entry_ptr..);
 
-        match slice {
-            Some(slice) => DirectoryEntry::new(self.zim, slice).ok(),
-            None => None,
-        }
+        Some(self.zim.get_by_url_index(idx))
     }
 }

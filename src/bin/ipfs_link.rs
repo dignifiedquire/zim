@@ -55,8 +55,13 @@ fn main() {
     p1.message("Building cluster map :");
 
     for i in zim.iterate_by_urls() {
-        if let Some(Target::Cluster(cid, _)) = i.target {
-            cluster_map.entry(cid).or_default().push(i);
+        match i {
+            Ok(i) => {
+                if let Some(Target::Cluster(cid, _)) = i.target {
+                    cluster_map.entry(cid).or_default().push(i);
+                }
+            }
+            Err(err) => eprintln!("skipping unreadable entry: {}", err),
         }
         p1.inc();
     }
@@ -70,17 +75,26 @@ fn main() {
 
     // link all redirects
     for entry in zim.iterate_by_urls() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                eprintln!("skipping unreadable entry: {}", err);
+                p3.inc();
+                continue;
+            }
+        };
+
         // get redirect entry
         if let Some(Target::Redirect(redir)) = entry.target {
             let redir = zim.get_by_url_index(redir).unwrap();
 
             let mut s = String::new();
-            s.push(redir.namespace as u8 as char);
+            s.push(redir.namespace.as_byte() as char);
             let src = root_output.join(&s).join(&redir.url);
 
             let mut d = String::new();
-            d.push(entry.namespace as u8 as char);
-            let dst = root_output.join(&s).join(&entry.url);
+            d.push(entry.namespace.as_byte() as char);
+            let dst = root_output.join(&d).join(&entry.url);
 
             if src != dst {
                 ops.push(format!(

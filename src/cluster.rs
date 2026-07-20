@@ -1,23 +1,25 @@
+use std::borrow::Cow;
 use std::fmt;
 use std::io::Cursor;
 use std::io::Read;
-use std::ops::Deref;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard};
 
 use bitreader::BitReader;
 use byteorder::{LittleEndian, ReadBytesExt};
-use memmap::Mmap;
-use ouroboros::self_referencing;
 use xz2::read::XzDecoder;
 
 use crate::errors::{Error, Result};
+use crate::store::Store;
 
+/// The compression applied to a cluster's payload.
+///
+/// Values 2 (zlib) and 3 (bzip2) were used by earlier writers but have since been removed from
+/// the format; libzim cannot read them either, so they are rejected rather than represented here.
+/// Value 0 is an obsolete encoding of "no compression" inherited from Zeno.
 #[repr(u8)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
 pub enum Compression {
-    None = 0,
-    Zlib = 2,
-    Bzip2 = 3,
+    None = 1,
     Lzma2 = 4,
     Zstd = 5,
 }
@@ -31,10 +33,8 @@ impl From<Compression> for u8 {
 impl Compression {
     pub fn from(raw: u8) -> Result<Compression> {
         match raw {
-            0 => Ok(Compression::None),
-            1 => Ok(Compression::None),
-            2 => Ok(Compression::Zlib),
-            3 => Ok(Compression::Bzip2),
+            0 | 1 => Ok(Compression::None),
+            2 | 3 => Err(Error::UnsupportedCompression(raw)),
             4 => Ok(Compression::Lzma2),
             5 => Ok(Compression::Zstd),
             _ => Err(Error::UnknownCompression(raw)),
@@ -50,12 +50,18 @@ impl Compression {
 pub struct Cluster<'a>(Arc<RwLock<InnerCluster<'a>>>);
 
 pub struct InnerCluster<'a> {
+    store: &'a Store,
     extended: bool,
     compression: Compression,
     start: u64,
     end: u64,
-    size: u64,
-    view: &'a [u8],
+    /// The data region, everything after the info byte, for an uncompressed cluster.
+    ///
+    /// Loaded on first blob access rather than at construction: clusters run to tens of
+    /// megabytes, and merely asking a cluster for its compression must not pull it in. Borrowed
+    /// from the mapping unless the cluster straddles a chunk boundary, which the format is not
+    /// supposed to allow but which costs nothing to support.
+    view: Option<Cow<'a, [u8]>>,
     blob_list: Option<Vec<u64>>, // offsets into data
     decompressed: Option<Vec<u8>>,
 }
@@ -68,8 +74,7 @@ impl<'a> fmt::Debug for Cluster<'a> {
             .field("compression", &raw.compression)
             .field("start", &raw.start)
             .field("end", &raw.end)
-            .field("size", &raw.size)
-            .field("view len", &raw.view.len())
+            .field("view len", &raw.view.as_ref().map(|view| view.len()))
             .field("blob_list", &raw.blob_list)
             .field(
                 "decompressed len",
@@ -80,188 +85,156 @@ impl<'a> fmt::Debug for Cluster<'a> {
 }
 
 impl<'a> Cluster<'a> {
-    pub fn new(
-        master_view: &'a Mmap,
-        cluster_list: &'a [u64],
-        idx: u32,
-        checksum_pos: u64,
-        version: u16,
-    ) -> Result<Cluster<'a>> {
+    /// Reads the cluster occupying `start..end`.
+    pub fn new(store: &'a Store, start: u64, end: u64, version: u16) -> Result<Cluster<'a>> {
         Ok(Cluster(Arc::new(RwLock::new(InnerCluster::new(
-            master_view,
-            cluster_list,
-            idx,
-            checksum_pos,
-            version,
+            store, start, end, version,
         )?))))
     }
 
+    /// Loads the cluster's data, decompressing it if necessary.
     pub fn decompress(&self) -> Result<()> {
-        self.0.write().unwrap().decompress()
+        self.0.write().unwrap().load()
     }
 
     pub fn compression(&self) -> Compression {
         self.0.read().unwrap().compression
     }
 
-    pub fn get_blob<'b: 'a>(&'b self, idx: u32) -> Result<Blob<'a, 'b>> {
+    /// Whether the cluster's data has been read yet.
+    ///
+    /// A cluster is loaded on first blob access, so this reports whether that has happened -
+    /// useful for confirming that merely inspecting a cluster did not pull it into memory.
+    pub fn is_loaded(&self) -> bool {
+        self.0.read().unwrap().blob_list.is_some()
+    }
+
+    /// Locks the cluster for reading, decompressing it first if necessary.
+    ///
+    /// Blobs are borrowed from the guard rather than copied. A blob can be very large - search
+    /// indexes run to gigabytes on a full archive - so the only allocation is the cluster's own
+    /// decompression buffer, which is computed once and shared by every blob in the cluster.
+    /// Uncompressed clusters, which is where the format requires indexes and listings to live,
+    /// are served straight from the mapping and allocate nothing at all.
+    pub fn read(&self) -> Result<ClusterGuard<'_, 'a>> {
         {
             let lock = self.0.read().unwrap();
-            if lock.needs_decompression() {
+            if lock.needs_loading() {
                 drop(lock);
-                self.0.write().unwrap().decompress()?;
+                self.0.write().unwrap().load()?;
             }
         }
 
-        let blob = BlobTryBuilder {
-            guard: self.0.read().unwrap(),
-            slice_builder: |guard| guard.get_blob(idx),
-        }
-        .try_build()?;
-
-        Ok(blob)
+        Ok(ClusterGuard(self.0.read().unwrap()))
     }
 }
 
-#[self_referencing]
-pub struct Blob<'a, 'b: 'a> {
-    guard: std::sync::RwLockReadGuard<'b, InnerCluster<'a>>,
-    #[borrows(guard)]
-    slice: &'this [u8],
-}
+/// Read access to a cluster's blobs.
+pub struct ClusterGuard<'g, 'a>(RwLockReadGuard<'g, InnerCluster<'a>>);
 
-impl<'a, 'b: 'a> Deref for Blob<'a, 'b> {
-    type Target = [u8];
-    fn deref(&self) -> &Self::Target {
-        self.borrow_slice()
+impl<'g, 'a> ClusterGuard<'g, 'a> {
+    /// Returns a blob's bytes, borrowed from the archive or from the decompression buffer.
+    pub fn blob(&self, idx: u32) -> Result<&[u8]> {
+        self.0.get_blob(idx)
     }
-}
 
-impl<'a, 'b: 'a> AsRef<[u8]> for Blob<'a, 'b> {
-    fn as_ref(&self) -> &[u8] {
-        self.borrow_slice()
+    /// Number of blobs in the cluster.
+    pub fn blob_count(&self) -> usize {
+        self.0.blob_count()
     }
 }
 
 impl<'a> InnerCluster<'a> {
-    fn new(
-        master_view: &'a Mmap,
-        cluster_list: &'a [u64],
-        idx: u32,
-        checksum_pos: u64,
-        version: u16,
-    ) -> Result<Self> {
-        let idx = idx as usize;
-        let start = cluster_list[idx];
-        let end = if idx < cluster_list.len() - 1 {
-            cluster_list[idx + 1]
-        } else {
-            checksum_pos
-        };
+    fn new(store: &'a Store, start: u64, end: u64, version: u16) -> Result<Self> {
+        if end <= start {
+            return Err(Error::OutOfBounds);
+        }
 
-        assert!(end > start);
-        let cluster_size = end - start;
-        let cluster_view = master_view
-            .get(start as usize..end as usize)
-            .ok_or(Error::OutOfBounds)?;
-
-        let (extended, compression) =
-            parse_details(cluster_view.first().ok_or(Error::OutOfBounds)?)?;
+        // Only the info byte: the data region is loaded on demand.
+        let details = store.slice(start, 1)?;
+        let (extended, compression) = parse_details(details.first().ok_or(Error::OutOfBounds)?)?;
 
         // extended clusters are only allowed in version 6
         if extended && version != 6 {
             return Err(Error::InvalidClusterExtension);
         }
 
-        let blob_list = if Compression::None == compression {
-            let cur = Cursor::new(&cluster_view[1..]);
-            Some(parse_blob_list(cur, extended)?)
-        } else {
-            None
-        };
-
         Ok(Self {
+            store,
             extended,
             compression,
             start,
             end,
-            size: cluster_size,
-            view: cluster_view,
+            view: None,
             decompressed: None,
-            blob_list,
+            blob_list: None,
         })
     }
 
-    fn needs_decompression(&self) -> bool {
-        match self.compression {
-            Compression::Lzma2 | Compression::Bzip2 | Compression::Zlib | Compression::Zstd => {
-                self.decompressed.is_none() || self.blob_list.is_none()
-            }
-            Compression::None => false,
-        }
+    fn needs_loading(&self) -> bool {
+        self.blob_list.is_none()
     }
 
-    fn decompress(&mut self) -> Result<()> {
-        if self.decompressed.is_none() {
-            match self.compression {
-                Compression::Lzma2 => {
-                    let mut decoder = XzDecoder::new(&self.view[1..]);
-                    let mut d = Vec::with_capacity(self.view.len());
-                    decoder.read_to_end(&mut d)?;
-                    self.decompressed = Some(d);
-                }
-                Compression::Bzip2 => {
-                    todo!("bzip2");
-                }
-                Compression::Zlib => {
-                    todo!("zlib");
-                }
-                Compression::Zstd => {
-                    let out = zstd::stream::decode_all(&self.view[1..])?;
-                    self.decompressed = Some(out);
-                }
-                Compression::None => {}
-            }
+    /// Makes the cluster's data available, decompressing it if necessary.
+    fn load(&mut self) -> Result<()> {
+        if self.blob_list.is_some() {
+            return Ok(());
         }
 
-        if self.blob_list.is_none() {
-            match self.compression {
-                Compression::Lzma2 | Compression::Bzip2 | Compression::Zlib | Compression::Zstd => {
-                    let cur = Cursor::new(self.decompressed.as_ref().unwrap());
-                    let blob_list = parse_blob_list(cur, self.extended)?;
-                    self.blob_list = Some(blob_list);
-                }
-                Compression::None => {}
+        let store = self.store;
+        let payload = self.start + 1;
+
+        match self.compression {
+            Compression::None => {
+                let view = store.slice(payload, self.end - payload)?;
+                self.blob_list = Some(parse_blob_list(Cursor::new(&view[..]), self.extended)?);
+                self.view = Some(view);
+            }
+            // The compressed bytes are streamed into the decoder rather than materialised first.
+            Compression::Lzma2 => {
+                let mut out = Vec::new();
+                XzDecoder::new(store.reader(payload, self.end)).read_to_end(&mut out)?;
+                self.blob_list = Some(parse_blob_list(Cursor::new(&out[..]), self.extended)?);
+                self.decompressed = Some(out);
+            }
+            Compression::Zstd => {
+                let out = zstd::stream::decode_all(store.reader(payload, self.end))?;
+                self.blob_list = Some(parse_blob_list(Cursor::new(&out[..]), self.extended)?);
+                self.decompressed = Some(out);
             }
         }
 
         Ok(())
     }
 
-    fn get_blob(&self, idx: u32) -> Result<&[u8]> {
-        match self.blob_list {
-            Some(ref list) => {
-                let start = list[idx as usize] as usize;
-                let n = idx as usize + 1;
-                let end = if list.len() > n {
-                    list[n] as usize
-                } else {
-                    self.size as usize
-                };
-
-                Ok(match self.compression {
-                    Compression::Lzma2
-                    | Compression::Bzip2
-                    | Compression::Zlib
-                    | Compression::Zstd => {
-                        // decompressed, so we know this exists
-                        &self.decompressed.as_ref().unwrap().as_slice()[start..end]
-                    }
-                    Compression::None => &self.view[1 + start..1 + end],
-                })
-            }
-            None => Err(Error::MissingBlobList),
+    /// The cluster's data, blob offsets index into this.
+    fn data(&self) -> Result<&[u8]> {
+        match (self.view.as_ref(), self.decompressed.as_ref()) {
+            (Some(view), _) => Ok(view),
+            (_, Some(decompressed)) => Ok(decompressed),
+            _ => Err(Error::MissingBlobList),
         }
+    }
+
+    /// The offset table carries one entry more than there are blobs, the last being the end of
+    /// the data area.
+    fn blob_count(&self) -> usize {
+        self.blob_list
+            .as_ref()
+            .map_or(0, |list| list.len().saturating_sub(1))
+    }
+
+    fn get_blob(&self, idx: u32) -> Result<&[u8]> {
+        let list = self.blob_list.as_ref().ok_or(Error::MissingBlobList)?;
+
+        // The offset table always holds one more entry than there are blobs; the final entry is
+        // the end of the data area. So `idx` is only valid while `idx + 1` is still in the table.
+        let idx = idx as usize;
+        let start = usize::try_from(*list.get(idx).ok_or(Error::OutOfBounds)?)?;
+        let end = usize::try_from(*list.get(idx + 1).ok_or(Error::OutOfBounds)?)?;
+
+        // Offsets are relative to the start of the offset table, which is the data region.
+        self.data()?.get(start..end).ok_or(Error::OutOfBounds)
     }
 }
 
@@ -287,27 +260,144 @@ fn parse_details(details: &u8) -> Result<(bool, Compression)> {
     Ok((reader.read_bool()?, Compression::from(reader.read_u8(4)?)?))
 }
 
+/// Parses a cluster's blob offset table.
+///
+/// The table holds one offset per blob plus a final offset marking the end of the data area, so a
+/// cluster with N blobs has N+1 offsets. Offsets are relative to the start of the table, which
+/// means the first offset is also the table's own size - dividing it by the offset size yields the
+/// number of entries.
 fn parse_blob_list<T: ReadBytesExt>(mut cur: T, extended: bool) -> Result<Vec<u64>> {
-    let mut blob_list = Vec::new();
+    let offset_size: u64 = if extended { 8 } else { 4 };
 
-    // determine the count of blobs, by reading the first offset
-    let first = if extended {
-        cur.read_u64::<LittleEndian>()?
-    } else {
-        cur.read_u32::<LittleEndian>()? as u64
+    let read_offset = |cur: &mut T| -> Result<u64> {
+        Ok(if extended {
+            cur.read_u64::<LittleEndian>()?
+        } else {
+            cur.read_u32::<LittleEndian>()? as u64
+        })
     };
 
-    let count = if extended { first / 8 } else { first / 4 };
+    let first = read_offset(&mut cur)?;
+    // A table must hold at least the end sentinel, and can only consist of whole offsets.
+    if first < offset_size || first % offset_size != 0 {
+        return Err(Error::InvalidBlobList);
+    }
+    let count = first / offset_size;
 
-    blob_list.push(first);
-
-    for _ in 0..(count as usize - 1) {
-        if extended {
-            blob_list.push(cur.read_u64::<LittleEndian>()?);
-        } else {
-            blob_list.push(cur.read_u32::<LittleEndian>()? as u64);
+    // Deliberately not pre-allocating: `count` comes straight off disk.
+    let mut blob_list = vec![first];
+    let mut prev = first;
+    for _ in 1..count {
+        let offset = read_offset(&mut cur)?;
+        if offset < prev {
+            return Err(Error::InvalidBlobList);
         }
+        prev = offset;
+        blob_list.push(offset);
     }
 
     Ok(blob_list)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn removed_compressions_are_rejected() {
+        // zlib (2) and bzip2 (3) were dropped from the format; libzim cannot read them either, so
+        // they must fail cleanly rather than reach an unimplemented decoder.
+        assert!(matches!(
+            Compression::from(2),
+            Err(Error::UnsupportedCompression(2))
+        ));
+        assert!(matches!(
+            Compression::from(3),
+            Err(Error::UnsupportedCompression(3))
+        ));
+
+        // 0 is Zeno's obsolete spelling of "no compression", 1 is the current one.
+        assert_eq!(Compression::from(0).unwrap(), Compression::None);
+        assert_eq!(Compression::from(1).unwrap(), Compression::None);
+        assert_eq!(Compression::from(4).unwrap(), Compression::Lzma2);
+        assert_eq!(Compression::from(5).unwrap(), Compression::Zstd);
+        assert!(matches!(
+            Compression::from(6),
+            Err(Error::UnknownCompression(6))
+        ));
+    }
+
+    #[test]
+    fn blob_list_rejects_malformed_first_offset() {
+        // The first offset is the table's own size, so it must be a non-zero multiple of the
+        // offset width. Anything below the width made the entry count underflow to usize::MAX.
+        for bad in [0u32, 1, 2, 3, 6] {
+            assert!(
+                parse_blob_list(Cursor::new(bad.to_le_bytes()), false).is_err(),
+                "first offset {bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn blob_list_accepts_zero_blob_cluster() {
+        // A table holding only the end sentinel is legal and describes a cluster with no blobs.
+        let list = parse_blob_list(Cursor::new(4u32.to_le_bytes()), false).unwrap();
+        assert_eq!(list, vec![4]);
+    }
+
+    #[test]
+    fn blob_list_rejects_decreasing_offsets() {
+        // Offsets delimit consecutive blobs, so a decreasing pair would yield an inverted range.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&12u32.to_le_bytes()); // three offsets
+        raw.extend_from_slice(&20u32.to_le_bytes());
+        raw.extend_from_slice(&16u32.to_le_bytes()); // goes backwards
+        assert!(parse_blob_list(Cursor::new(raw.as_slice()), false).is_err());
+    }
+
+    /// Extended clusters use 64-bit offsets, so nothing about them is exercised by an archive
+    /// built from 32-bit ones. A swapped bit position in `parse_details`, or a u32/u64 mix-up in
+    /// the offset reader, would silently misparse every offset rather than error.
+    #[test]
+    fn parses_extended_clusters() {
+        // Fifth bit marks extended; the low nibble is the compression.
+        assert_eq!(parse_details(&0x01).unwrap(), (false, Compression::None));
+        assert_eq!(parse_details(&0x11).unwrap(), (true, Compression::None));
+        assert_eq!(parse_details(&0x05).unwrap(), (false, Compression::Zstd));
+        assert_eq!(parse_details(&0x15).unwrap(), (true, Compression::Zstd));
+        assert_eq!(parse_details(&0x14).unwrap(), (true, Compression::Lzma2));
+
+        // A table of three 64-bit offsets: two blobs plus the end sentinel.
+        let mut raw = Vec::new();
+        for offset in [24u64, 27, 31] {
+            raw.extend_from_slice(&offset.to_le_bytes());
+        }
+        let list = parse_blob_list(Cursor::new(raw.as_slice()), true).unwrap();
+        assert_eq!(list, vec![24, 27, 31]);
+
+        // The same validation applies, against the wider offset size.
+        for bad in [0u64, 4, 7, 12, 20] {
+            assert!(
+                parse_blob_list(Cursor::new(bad.to_le_bytes()), true).is_err(),
+                "extended first offset {bad} should be rejected"
+            );
+        }
+        // Exactly one offset is a legal zero-blob cluster.
+        assert_eq!(
+            parse_blob_list(Cursor::new(8u64.to_le_bytes()), true).unwrap(),
+            vec![8]
+        );
+    }
+
+    /// A first offset near `u32::MAX` implies hundreds of millions of entries. It must be
+    /// rejected by reading, not by allocating - the parser deliberately does not pre-allocate
+    /// from a count that came off disk.
+    #[test]
+    fn blob_list_rejects_an_absurd_first_offset() {
+        assert!(parse_blob_list(Cursor::new(0xFFFF_FFF0u32.to_le_bytes()), false).is_err());
+        assert!(
+            parse_blob_list(Cursor::new(0xFFFF_FFFF_FFFF_FFF8u64.to_le_bytes()), true).is_err()
+        );
+    }
 }

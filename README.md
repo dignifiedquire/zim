@@ -8,6 +8,27 @@
 > cargo build --release
 ```
 
+## Tests
+
+Tests run against the [openZIM testing suite](https://github.com/openzim/zim-testing-suite),
+vendored as a submodule pinned to a release tag. It covers every format version the crate reads
+(5.0, 6.1, 6.2, 6.3) plus a set of deliberately corrupted archives.
+
+```sh
+> git submodule update --init
+> cargo test
+```
+
+## Split archives
+
+Archives split into chunks (`data.zimaa`, `data.zimab`, ...) are read transparently. Name either
+the archive or its first chunk:
+
+```sh
+> ./target/release/zim-info data.zim
+> ./target/release/zim-info data.zimaa
+```
+
 ## Usage with IPFS
 
 To add a file `data.zim` to ipfs do the following.
