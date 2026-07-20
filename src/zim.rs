@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::io::BufRead;
 use std::io::Cursor;
@@ -64,9 +63,6 @@ pub struct Zim {
 
     /// List of mimetypes used in this ZIM archive
     pub mime_table: Vec<String>, // a list of mimetypes
-    pub url_list: Vec<u64>,             // a list of offsets
-    pub article_list: Option<Vec<u32>>, // a list of indicies into url_list
-    pub cluster_list: Vec<u64>,         // a list of offsets
 
     /// MD5 checksum.
     pub checksum: Checksum,
@@ -121,18 +117,41 @@ impl<'a> Content<'a> {
     }
 }
 
-/// A list of entry indices stored as an archive entry.
+/// A list of entry indices, ordered by title.
 ///
-/// Listings are one `u32` per article, so a full archive's listing is tens of megabytes. The
-/// indices are decoded on demand rather than up front.
+/// Listings are one `u32` per entry, so a full archive's listing is tens of megabytes. The indices
+/// are decoded on demand rather than up front.
 pub struct Listing<'a> {
-    content: Content<'a>,
+    source: Source<'a>,
+}
+
+enum Source<'a> {
+    /// An `X/listing/...` entry.
+    Entry(Content<'a>),
+    /// A pointer list addressed directly, as the header's title pointer list is.
+    Region {
+        store: &'a Store,
+        pos: u64,
+        count: u32,
+    },
+}
+
+/// Indices read per `Store` access when walking a pointer list, bounding what a listing that
+/// straddles a chunk boundary has to copy.
+const LISTING_BATCH: u32 = 16 * 1024;
+
+fn index_at(raw: &[u8], pos: usize) -> Option<u32> {
+    raw.get(pos * 4..pos * 4 + 4)
+        .map(|raw| u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
 }
 
 impl<'a> Listing<'a> {
     /// Number of indices in the listing.
     pub fn len(&self) -> Result<usize> {
-        Ok(self.content.len()? / 4)
+        match &self.source {
+            Source::Entry(content) => Ok(content.len()? / 4),
+            Source::Region { count, .. } => Ok(*count as usize),
+        }
     }
 
     pub fn is_empty(&self) -> Result<bool> {
@@ -141,19 +160,49 @@ impl<'a> Listing<'a> {
 
     /// The entry index at `pos`.
     pub fn get(&self, pos: usize) -> Result<Option<u32>> {
-        self.content.with(|raw| {
-            raw.get(pos * 4..pos * 4 + 4)
-                .map(|raw| u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
-        })
+        match &self.source {
+            Source::Entry(content) => content.with(|raw| index_at(raw, pos)),
+            Source::Region {
+                store,
+                pos: base,
+                count,
+            } => {
+                if pos >= *count as usize {
+                    return Ok(None);
+                }
+
+                let at = base.checked_add(pos as u64 * 4).ok_or(Error::OutOfBounds)?;
+
+                Ok(index_at(&store.slice(at, 4)?, 0))
+            }
+        }
     }
 
     /// Calls `f` with each entry index, in order.
     pub fn for_each(&self, mut f: impl FnMut(u32)) -> Result<()> {
-        self.content.with(|raw| {
+        let decode = |raw: &[u8], f: &mut dyn FnMut(u32)| {
             for raw in raw.chunks_exact(4) {
                 f(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]));
             }
-        })
+        };
+
+        match &self.source {
+            Source::Entry(content) => content.with(|raw| decode(raw, &mut f)),
+            Source::Region { store, pos, count } => {
+                let mut done = 0u32;
+                while done < *count {
+                    let batch = LISTING_BATCH.min(*count - done);
+                    let at = pos
+                        .checked_add(u64::from(done) * 4)
+                        .ok_or(Error::OutOfBounds)?;
+
+                    decode(&store.slice(at, u64::from(batch) * 4)?, &mut f);
+                    done += batch;
+                }
+
+                Ok(())
+            }
+        }
     }
 
     /// Copies the listing into a `Vec`.
@@ -246,6 +295,38 @@ impl ZimHeader {
             return Err(Error::InvalidHeader("clusterCount exceeds entryCount"));
         }
 
+        // The pointer lists are read on demand, so check here that they fit - otherwise a bad
+        // extent is only discovered on whichever access happens to run off the end.
+        for (pos, count, width, what) in [
+            (
+                self.url_ptr_pos,
+                self.article_count,
+                8,
+                "path pointer list runs past the end of file",
+            ),
+            (
+                self.cluster_ptr_pos,
+                self.cluster_count,
+                8,
+                "cluster pointer list runs past the end of file",
+            ),
+            (
+                self.title_ptr_pos.unwrap_or(0),
+                self.title_ptr_pos.map_or(0, |_| self.article_count),
+                4,
+                "title pointer list runs past the end of file",
+            ),
+        ] {
+            let end = u64::from(count)
+                .checked_mul(width)
+                .and_then(|len| pos.checked_add(len))
+                .ok_or(Error::InvalidHeader(what))?;
+
+            if end > file_len {
+                return Err(Error::InvalidHeader(what));
+            }
+        }
+
         Ok(())
     }
 }
@@ -259,17 +340,6 @@ impl Zim {
         let store = Store::open(p.as_ref())?;
 
         let (header, mime_table) = parse_header(&store)?;
-        let url_list = parse_url_list(&store, header.url_ptr_pos, header.article_count)?;
-        let article_list = if let Some(title_ptr_pos) = header.title_ptr_pos {
-            let list = parse_article_list(&store, title_ptr_pos, header.article_count)?;
-            Some(list)
-        } else {
-            None
-        };
-
-        let cluster_list =
-            parse_cluster_list(&store, header.cluster_ptr_pos, header.cluster_count)?;
-
         let checksum = read_checksum(&store, header.checksum_pos)?;
 
         Ok(Zim {
@@ -277,11 +347,38 @@ impl Zim {
             file_path: p.as_ref().into(),
             store,
             mime_table,
-            url_list,
-            article_list,
-            cluster_list,
             checksum,
         })
+    }
+
+    /// Offset of the directory entry at `idx` in the path pointer list.
+    fn url_offset(&self, idx: u32) -> Result<u64> {
+        self.pointer(self.header.url_ptr_pos, idx, self.header.article_count)
+    }
+
+    /// Offset of cluster `idx` in the cluster pointer list.
+    fn cluster_offset(&self, idx: u32) -> Result<u64> {
+        self.pointer(self.header.cluster_ptr_pos, idx, self.header.cluster_count)
+    }
+
+    /// Reads one 8 byte pointer out of a pointer list.
+    ///
+    /// The lists are read from the mapping on demand rather than materialised at open. A full
+    /// archive has millions of entries, and at 8 bytes each the path pointer list alone would
+    /// outweigh everything else the reader holds.
+    fn pointer(&self, base: u64, idx: u32, count: u32) -> Result<u64> {
+        if idx >= count {
+            return Err(Error::OutOfBounds);
+        }
+
+        let at = base
+            .checked_add(u64::from(idx) * 8)
+            .ok_or(Error::OutOfBounds)?;
+
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(&self.store.slice(at, 8)?);
+
+        Ok(u64::from_le_bytes(raw))
     }
 
     /// Computes the checksum, and returns an error if it does not match the one in
@@ -323,7 +420,7 @@ impl Zim {
     ///
     /// idx must be between 0 and `article_count`
     pub fn get_by_url_index(&self, idx: u32) -> Result<DirectoryEntry> {
-        let entry_offset = *self.url_list.get(idx as usize).ok_or(Error::OutOfBounds)?;
+        let entry_offset = self.url_offset(idx)?;
         let dir_view = self.store.slice_upto(entry_offset, MAX_DIRENT_SIZE)?;
 
         DirectoryEntry::new(self, &dir_view)
@@ -340,7 +437,7 @@ impl Zim {
     pub fn find_by_path(&self, namespace: Namespace, path: &str) -> Result<Option<u32>> {
         let idx = self.lower_bound(namespace.as_byte(), path)?;
 
-        if (idx as usize) < self.url_list.len() {
+        if idx < self.header.article_count {
             let entry = self.get_by_url_index(idx)?;
             if entry.namespace == namespace && entry.url == path {
                 return Ok(Some(idx));
@@ -355,7 +452,7 @@ impl Zim {
         let target = (namespace, path.as_bytes());
 
         let mut low = 0usize;
-        let mut high = self.url_list.len();
+        let mut high = self.header.article_count as usize;
 
         while low < high {
             let mid = low + (high - low) / 2;
@@ -385,7 +482,7 @@ impl Zim {
         let start = self.lower_bound(namespace.as_byte(), "")?;
         let end = match namespace.as_byte().checked_add(1) {
             Some(next) => self.lower_bound(next, "")?,
-            None => self.url_list.len() as u32,
+            None => self.header.article_count,
         };
 
         Ok(start..end)
@@ -460,14 +557,23 @@ impl Zim {
             .collect()
     }
 
-    /// Returns every entry ordered by title, from the `X/listing/titleOrdered/v0` entry.
+    /// Returns every entry ordered by title.
     ///
-    /// Format version 6.3 removed this listing, so it returns `None` there - use
-    /// [`Zim::article_list_by_title`] instead. Archives predating the listing carry the same
-    /// content in the deprecated [`Zim::article_list`] field, which the spec names as the
-    /// fallback.
+    /// Prefers the `X/listing/titleOrdered/v0` entry and falls back to the header's title pointer
+    /// list, as the spec directs. Format version 6.3 removed both, so this returns `None` there -
+    /// use [`Zim::article_list_by_title`] instead.
     pub fn entry_list_by_title(&self) -> Result<Option<Listing<'_>>> {
-        self.listing(LISTING_TITLE_ORDERED_V0)
+        if let Some(listing) = self.listing(LISTING_TITLE_ORDERED_V0)? {
+            return Ok(Some(listing));
+        }
+
+        Ok(self.header.title_ptr_pos.map(|pos| Listing {
+            source: Source::Region {
+                store: &self.store,
+                pos,
+                count: self.header.article_count,
+            },
+        }))
     }
 
     /// Returns the archive's article entries ordered by title.
@@ -501,7 +607,9 @@ impl Zim {
             return Err(Error::InvalidListing);
         }
 
-        Ok(Some(Listing { content }))
+        Ok(Some(Listing {
+            source: Source::Entry(content),
+        }))
     }
 
     fn index_entry(&self, path: &str) -> Result<Option<Content<'_>>> {
@@ -515,13 +623,15 @@ impl Zim {
     ///
     /// idx must be between 0 and `cluster_count`
     pub fn get_cluster(&self, idx: u32) -> Result<Cluster<'_>> {
-        Cluster::new(
-            &self.store,
-            &self.cluster_list,
-            idx,
-            self.header.checksum_pos,
-            self.header.version_major,
-        )
+        let start = self.cluster_offset(idx)?;
+        // The last cluster runs up to the checksum, which is always the final 16 bytes.
+        let end = if idx + 1 < self.header.cluster_count {
+            self.cluster_offset(idx + 1)?
+        } else {
+            self.header.checksum_pos
+        };
+
+        Cluster::new(&self.store, start, end, self.header.version_major)
     }
 }
 
@@ -619,55 +729,6 @@ fn parse_header(store: &Store) -> Result<(ZimHeader, Vec<String>)> {
     };
 
     Ok((header, mime_table))
-}
-
-/// Returns the `count * width` byte region a pointer list occupies.
-///
-/// `ptr_pos` and `count` come straight from the header, so the extent is computed with checked
-/// arithmetic - otherwise a large value wraps and the bounds check passes vacuously.
-fn pointer_list_view(store: &Store, ptr_pos: u64, count: u32, width: u64) -> Result<Cow<'_, [u8]>> {
-    let len = u64::from(count)
-        .checked_mul(width)
-        .ok_or(Error::OutOfBounds)?;
-
-    store.slice(ptr_pos, len)
-}
-
-/// Parses the Path Pointer List (called the URL Pointer List before April 2024).
-/// See https://wiki.openzim.org/wiki/ZIM_file_format#Path_Pointer_List_(pathPtrPos)
-fn parse_url_list(store: &Store, ptr_pos: u64, count: u32) -> Result<Vec<u64>> {
-    let view = pointer_list_view(store, ptr_pos, count, 8)?;
-    let mut cur = Cursor::new(&view[..]);
-
-    let mut out: Vec<u64> = Vec::new();
-    for _ in 0..count {
-        out.push(cur.read_u64::<LittleEndian>()?);
-    }
-
-    Ok(out)
-}
-
-fn parse_article_list(store: &Store, ptr_pos: u64, count: u32) -> Result<Vec<u32>> {
-    let view = pointer_list_view(store, ptr_pos, count, 4)?;
-    let mut cur = Cursor::new(&view[..]);
-
-    let mut out: Vec<u32> = Vec::new();
-    for _ in 0..count {
-        out.push(cur.read_u32::<LittleEndian>()?);
-    }
-
-    Ok(out)
-}
-
-fn parse_cluster_list(store: &Store, ptr_pos: u64, count: u32) -> Result<Vec<u64>> {
-    let view = pointer_list_view(store, ptr_pos, count, 8)?;
-    let mut cluster_cur = Cursor::new(&view[..]);
-
-    let mut out: Vec<u64> = Vec::new();
-    for _ in 0..count {
-        out.push(cluster_cur.read_u64::<LittleEndian>()?);
-    }
-    Ok(out)
 }
 
 /// Read out the the 16 byte long MD5 checksum.
@@ -965,6 +1026,97 @@ mod tests {
         assert_eq!(title.len().unwrap(), 917_504);
     }
 
+    /// The spec says `titlePtrPos` points directly at the `v0` listing entry's data, so the
+    /// header fallback must produce exactly what the entry does.
+    #[test]
+    fn title_pointer_fallback_matches_the_v0_listing() {
+        let zim = Zim::new("fixtures/speedtest_en_blob-mini_2024-05.zim")
+            .expect("failed to parse fixture");
+
+        let via_entry = zim
+            .entry_list_by_title()
+            .unwrap()
+            .expect("6.2 archives carry the v0 listing")
+            .to_vec()
+            .unwrap();
+        assert_eq!(via_entry.len(), zim.header.article_count as usize);
+
+        let header_listing = Listing {
+            source: Source::Region {
+                store: &zim.store,
+                pos: zim
+                    .header
+                    .title_ptr_pos
+                    .expect("6.2 archives carry titlePtrPos"),
+                count: zim.header.article_count,
+            },
+        };
+        assert_eq!(header_listing.to_vec().unwrap(), via_entry);
+
+        // Random access must agree with the sequential walk, and stop at the end.
+        for (pos, expected) in via_entry.iter().enumerate() {
+            assert_eq!(header_listing.get(pos).unwrap(), Some(*expected));
+        }
+        assert_eq!(header_listing.get(via_entry.len()).unwrap(), None);
+    }
+
+    /// A pointer list is walked in bounded batches so that a listing straddling a chunk boundary
+    /// does not have to be copied whole. The batch seams must not drop or duplicate indices.
+    #[test]
+    fn region_listing_walks_batch_boundaries_correctly() {
+        let zim =
+            Zim::new("fixtures/wikipedia_en_100_2026-04.zim").expect("failed to parse fixture");
+
+        // Any region of the archive decodes as a list of u32; the values are meaningless here,
+        // the point is that the walk spans several batches.
+        let count = LISTING_BATCH * 2 + 7;
+        let pos = 4096u64;
+
+        let listing = Listing {
+            source: Source::Region {
+                store: &zim.store,
+                pos,
+                count,
+            },
+        };
+
+        let raw = zim.store.slice(pos, u64::from(count) * 4).unwrap();
+        let expected: Vec<u32> = raw
+            .chunks_exact(4)
+            .map(|raw| u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
+            .collect();
+
+        assert_eq!(listing.len().unwrap(), count as usize);
+        assert_eq!(listing.to_vec().unwrap(), expected);
+        assert_eq!(
+            listing.get(LISTING_BATCH as usize).unwrap(),
+            Some(expected[LISTING_BATCH as usize])
+        );
+    }
+
+    /// Asking a cluster about itself must not pull its data in. Clusters are not small - the
+    /// largest in this fixture is 78MB - so a reader that inspects every cluster, as `zim-info`
+    /// does, would otherwise fault in most of the archive.
+    #[test]
+    fn cluster_data_loads_only_on_blob_access() {
+        let zim =
+            Zim::new("fixtures/wikipedia_en_100_2026-04.zim").expect("failed to parse fixture");
+
+        for idx in 0..zim.header.cluster_count {
+            let cluster = zim.get_cluster(idx).unwrap();
+            let _ = cluster.compression();
+            assert!(
+                !cluster.is_loaded(),
+                "cluster {idx} was loaded just to report its compression"
+            );
+        }
+
+        let cluster = zim.get_cluster(0).unwrap();
+        let guard = cluster.read().unwrap();
+        assert!(guard.blob_count() > 0);
+        assert!(cluster.is_loaded(), "reading a blob must load the cluster");
+    }
+
     /// Content from an uncompressed cluster must be borrowed straight from the mapping rather
     /// than copied. This is what keeps a multi-gigabyte search index from having to be read into
     /// memory in order to be used, and the format requires indexes and listings to be stored
@@ -1129,7 +1281,7 @@ mod tests {
             .expect("failed to read fixture");
         let file_len = original.len() as u64;
 
-        let cases: [(usize, Vec<u8>, &str); 5] = [
+        let cases: [(usize, Vec<u8>, &str); 6] = [
             (
                 32,
                 8u64.to_le_bytes().into(),
@@ -1154,6 +1306,13 @@ mod tests {
                 28,
                 u32::MAX.to_le_bytes().into(),
                 "clusterCount exceeding entryCount",
+            ),
+            // Valid on its own, but the list it points at cannot fit in what is left of the file.
+            // The lists are read on demand, so this has to be caught here rather than on access.
+            (
+                32,
+                (file_len - 10).to_le_bytes().into(),
+                "path pointer list running past the end",
             ),
         ];
 

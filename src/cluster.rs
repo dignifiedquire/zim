@@ -50,14 +50,18 @@ impl Compression {
 pub struct Cluster<'a>(Arc<RwLock<InnerCluster<'a>>>);
 
 pub struct InnerCluster<'a> {
+    store: &'a Store,
     extended: bool,
     compression: Compression,
     start: u64,
     end: u64,
-    size: u64,
-    /// The cluster's bytes. Borrowed from the mapping unless the cluster straddles a chunk
-    /// boundary, which the format is not supposed to allow but which costs nothing to support.
-    view: Cow<'a, [u8]>,
+    /// The data region, everything after the info byte, for an uncompressed cluster.
+    ///
+    /// Loaded on first blob access rather than at construction: clusters run to tens of
+    /// megabytes, and merely asking a cluster for its compression must not pull it in. Borrowed
+    /// from the mapping unless the cluster straddles a chunk boundary, which the format is not
+    /// supposed to allow but which costs nothing to support.
+    view: Option<Cow<'a, [u8]>>,
     blob_list: Option<Vec<u64>>, // offsets into data
     decompressed: Option<Vec<u8>>,
 }
@@ -70,8 +74,7 @@ impl<'a> fmt::Debug for Cluster<'a> {
             .field("compression", &raw.compression)
             .field("start", &raw.start)
             .field("end", &raw.end)
-            .field("size", &raw.size)
-            .field("view len", &raw.view.len())
+            .field("view len", &raw.view.as_ref().map(|view| view.len()))
             .field("blob_list", &raw.blob_list)
             .field(
                 "decompressed len",
@@ -82,28 +85,26 @@ impl<'a> fmt::Debug for Cluster<'a> {
 }
 
 impl<'a> Cluster<'a> {
-    pub fn new(
-        store: &'a Store,
-        cluster_list: &'a [u64],
-        idx: u32,
-        checksum_pos: u64,
-        version: u16,
-    ) -> Result<Cluster<'a>> {
+    /// Reads the cluster occupying `start..end`.
+    pub fn new(store: &'a Store, start: u64, end: u64, version: u16) -> Result<Cluster<'a>> {
         Ok(Cluster(Arc::new(RwLock::new(InnerCluster::new(
-            store,
-            cluster_list,
-            idx,
-            checksum_pos,
-            version,
+            store, start, end, version,
         )?))))
     }
 
+    /// Loads the cluster's data, decompressing it if necessary.
     pub fn decompress(&self) -> Result<()> {
-        self.0.write().unwrap().decompress()
+        self.0.write().unwrap().load()
     }
 
     pub fn compression(&self) -> Compression {
         self.0.read().unwrap().compression
+    }
+
+    /// Whether the cluster's data has been loaded yet.
+    #[cfg(test)]
+    pub(crate) fn is_loaded(&self) -> bool {
+        self.0.read().unwrap().blob_list.is_some()
     }
 
     /// Locks the cluster for reading, decompressing it first if necessary.
@@ -116,9 +117,9 @@ impl<'a> Cluster<'a> {
     pub fn read(&self) -> Result<ClusterGuard<'_, 'a>> {
         {
             let lock = self.0.read().unwrap();
-            if lock.needs_decompression() {
+            if lock.needs_loading() {
                 drop(lock);
-                self.0.write().unwrap().decompress()?;
+                self.0.write().unwrap().load()?;
             }
         }
 
@@ -142,94 +143,75 @@ impl<'g, 'a> ClusterGuard<'g, 'a> {
 }
 
 impl<'a> InnerCluster<'a> {
-    fn new(
-        store: &'a Store,
-        cluster_list: &'a [u64],
-        idx: u32,
-        checksum_pos: u64,
-        version: u16,
-    ) -> Result<Self> {
-        let idx = idx as usize;
-        let start = *cluster_list.get(idx).ok_or(Error::OutOfBounds)?;
-        // The last cluster runs up to the checksum, which is always the final 16 bytes.
-        let end = match cluster_list.get(idx + 1) {
-            Some(next) => *next,
-            None => checksum_pos,
-        };
-
+    fn new(store: &'a Store, start: u64, end: u64, version: u16) -> Result<Self> {
         if end <= start {
             return Err(Error::OutOfBounds);
         }
-        let cluster_size = end - start;
-        let cluster_view = store.slice(start, cluster_size)?;
 
-        let (extended, compression) =
-            parse_details(cluster_view.first().ok_or(Error::OutOfBounds)?)?;
+        // Only the info byte: the data region is loaded on demand.
+        let details = store.slice(start, 1)?;
+        let (extended, compression) = parse_details(details.first().ok_or(Error::OutOfBounds)?)?;
 
         // extended clusters are only allowed in version 6
         if extended && version != 6 {
             return Err(Error::InvalidClusterExtension);
         }
 
-        let blob_list = if Compression::None == compression {
-            let cur = Cursor::new(&cluster_view[1..]);
-            Some(parse_blob_list(cur, extended)?)
-        } else {
-            None
-        };
-
         Ok(Self {
+            store,
             extended,
             compression,
             start,
             end,
-            size: cluster_size,
-            view: cluster_view,
+            view: None,
             decompressed: None,
-            blob_list,
+            blob_list: None,
         })
     }
 
-    fn needs_decompression(&self) -> bool {
-        match self.compression {
-            Compression::Lzma2 | Compression::Zstd => {
-                self.decompressed.is_none() || self.blob_list.is_none()
-            }
-            Compression::None => false,
-        }
+    fn needs_loading(&self) -> bool {
+        self.blob_list.is_none()
     }
 
-    fn decompress(&mut self) -> Result<()> {
-        let payload = self.view.get(1..).ok_or(Error::OutOfBounds)?;
-
-        if self.decompressed.is_none() {
-            match self.compression {
-                Compression::Lzma2 => {
-                    let mut decoder = XzDecoder::new(payload);
-                    let mut d = Vec::with_capacity(self.view.len());
-                    decoder.read_to_end(&mut d)?;
-                    self.decompressed = Some(d);
-                }
-                Compression::Zstd => {
-                    let out = zstd::stream::decode_all(payload)?;
-                    self.decompressed = Some(out);
-                }
-                Compression::None => {}
-            }
+    /// Makes the cluster's data available, decompressing it if necessary.
+    fn load(&mut self) -> Result<()> {
+        if self.blob_list.is_some() {
+            return Ok(());
         }
 
-        if self.blob_list.is_none() {
-            match self.compression {
-                Compression::Lzma2 | Compression::Zstd => {
-                    let decompressed = self.decompressed.as_ref().ok_or(Error::MissingBlobList)?;
-                    let blob_list = parse_blob_list(Cursor::new(decompressed), self.extended)?;
-                    self.blob_list = Some(blob_list);
-                }
-                Compression::None => {}
+        let store = self.store;
+        let payload = self.start + 1;
+
+        match self.compression {
+            Compression::None => {
+                let view = store.slice(payload, self.end - payload)?;
+                self.blob_list = Some(parse_blob_list(Cursor::new(&view[..]), self.extended)?);
+                self.view = Some(view);
+            }
+            // The compressed bytes are streamed into the decoder rather than materialised first.
+            Compression::Lzma2 => {
+                let mut out = Vec::new();
+                XzDecoder::new(store.reader(payload, self.end)).read_to_end(&mut out)?;
+                self.blob_list = Some(parse_blob_list(Cursor::new(&out[..]), self.extended)?);
+                self.decompressed = Some(out);
+            }
+            Compression::Zstd => {
+                let out = zstd::stream::decode_all(store.reader(payload, self.end))?;
+                self.blob_list = Some(parse_blob_list(Cursor::new(&out[..]), self.extended)?);
+                self.decompressed = Some(out);
             }
         }
 
         Ok(())
+    }
+
+    /// The cluster's data, blob offsets index into this.
+    fn data(&self) -> Result<&[u8]> {
+        match (self.view.as_ref(), self.decompressed.as_ref()) {
+            (Some(view), _) => Ok(view),
+            (_, Some(decompressed)) => Ok(decompressed),
+            _ => Err(Error::MissingBlobList),
+        }
     }
 
     /// The offset table carries one entry more than there are blobs, the last being the end of
@@ -249,16 +231,8 @@ impl<'a> InnerCluster<'a> {
         let start = usize::try_from(*list.get(idx).ok_or(Error::OutOfBounds)?)?;
         let end = usize::try_from(*list.get(idx + 1).ok_or(Error::OutOfBounds)?)?;
 
-        match self.compression {
-            Compression::Lzma2 | Compression::Zstd => self
-                .decompressed
-                .as_ref()
-                .ok_or(Error::MissingBlobList)?
-                .get(start..end)
-                .ok_or(Error::OutOfBounds),
-            // Offsets are relative to the start of the offset table, which follows the info byte.
-            Compression::None => self.view.get(1 + start..1 + end).ok_or(Error::OutOfBounds),
-        }
+        // Offsets are relative to the start of the offset table, which is the data region.
+        self.data()?.get(start..end).ok_or(Error::OutOfBounds)
     }
 }
 

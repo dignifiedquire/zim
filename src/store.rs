@@ -147,6 +147,18 @@ impl Store {
         self.slice(start, len.min(self.len - start))
     }
 
+    /// Reads `start..end` as a stream, without materialising it.
+    ///
+    /// Used for compressed cluster payloads, which are fed straight to a decoder - a cluster can
+    /// be tens of megabytes, and copying it in order to decompress it would defeat the mapping.
+    pub fn reader(&self, start: u64, end: u64) -> StoreReader<'_> {
+        StoreReader {
+            store: self,
+            pos: start,
+            end: end.min(self.len),
+        }
+    }
+
     /// The mapped chunks covering the first `upto` bytes, in order.
     pub fn prefix_chunks(&self, upto: u64) -> Vec<&[u8]> {
         let mut out = Vec::new();
@@ -175,6 +187,37 @@ impl Store {
                 }
             })
             .map_err(|_| Error::OutOfBounds)
+    }
+}
+
+/// Streams a byte range of the archive, crossing chunk boundaries as needed.
+pub struct StoreReader<'a> {
+    store: &'a Store,
+    pos: u64,
+    end: u64,
+}
+
+impl std::io::Read for StoreReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.end || buf.is_empty() {
+            return Ok(0);
+        }
+
+        let idx = self
+            .store
+            .part_containing(self.pos)
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::UnexpectedEof))?;
+        let part = &self.store.parts[idx];
+
+        // One part per call; `Read` is free to return a short read, and the caller loops.
+        let available = self.end.min(part.end()) - self.pos;
+        let len = available.min(buf.len() as u64) as usize;
+        let from = (self.pos - part.start) as usize;
+
+        buf[..len].copy_from_slice(&part.map[from..from + len]);
+        self.pos += len as u64;
+
+        Ok(len)
     }
 }
 
