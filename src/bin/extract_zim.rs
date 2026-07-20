@@ -44,10 +44,7 @@ fn main() {
     let sw = Stopwatch::start_new();
     let zim_file = Zim::new(input).expect("failed to parse input");
 
-    if let Some(main_page_idx) = zim_file.header.main_page {
-        let page = zim_file
-            .get_by_url_index(main_page_idx)
-            .expect("failed to get main page");
+    if let Some(page) = zim_file.main_page().expect("failed to resolve main page") {
         println!("Main page is {}", page.url);
     }
     println!();

@@ -16,8 +16,15 @@ pub struct DirectoryEntry {
     pub mime_type: MimeType,
     /// defines to which namespace this directory entry belongs
     pub namespace: Namespace,
+    /// length of the extra parameters stored after the title
+    ///
+    /// The spec requires this to be 0 and libzim always writes 0, so it is exposed only so that
+    /// an archive using it can be recognised.
+    pub parameter_len: u8,
     /// identifies a revision of the contents of this directory entry, needed to identify
     /// updates or revisions in the original history
+    ///
+    /// The spec requires this to be 0 and it carries no meaning in practice.
     pub revision: Option<u32>,
     /// the URL as refered in the URL pointer list
     pub url: String,
@@ -32,9 +39,9 @@ impl DirectoryEntry {
         let mut cur = Cursor::new(s);
         let mime_id = cur.read_u16::<LittleEndian>()?;
         let mime_type = zim.get_mimetype(mime_id).ok_or(Error::UnknownMimeType)?;
-        let _ = cur.read_u8()?;
+        let parameter_len = cur.read_u8()?;
         let namespace = cur.read_u8()?;
-        let rev = cur.read_u32::<LittleEndian>().ok();
+        let rev = Some(cur.read_u32::<LittleEndian>()?);
 
         let target = if mime_type == MimeType::Redirect {
             // this is an index into the URL table
@@ -53,6 +60,7 @@ impl DirectoryEntry {
         Ok(DirectoryEntry {
             mime_type,
             namespace: Namespace::from(namespace),
+            parameter_len,
             revision: rev,
             url,
             title,

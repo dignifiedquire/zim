@@ -94,7 +94,7 @@ fn main() {
 
             let mut d = String::new();
             d.push(entry.namespace.as_byte() as char);
-            let dst = root_output.join(&s).join(&entry.url);
+            let dst = root_output.join(&d).join(&entry.url);
 
             if src != dst {
                 ops.push(format!(

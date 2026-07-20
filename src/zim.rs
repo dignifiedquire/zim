@@ -79,7 +79,10 @@ pub struct ZimHeader {
     /// position of the directory pointerlist ordered by URL
     pub url_ptr_pos: u64,
     /// position of the directory pointerlist ordered by Title
-    /// Deprecated in newer versions. Use `X/listing/titleordered/v0` instead.
+    ///
+    /// Obsolete: readers should prefer the `X/listing/titleOrdered/v0` entry and fall back to
+    /// this. Format version 6.3 removed both, leaving only the article listing - see
+    /// [`Zim::entry_list_by_title`] and [`Zim::article_list_by_title`].
     pub title_ptr_pos: Option<u64>,
     /// position of the cluster pointer list
     pub cluster_ptr_pos: u64,
@@ -197,12 +200,11 @@ impl Zim {
             0xfffe => Some(MimeType::LinkTarget),
             0xfffd => Some(MimeType::DeletedEntry),
             id => {
-                if (id as usize) < self.mime_table.len() {
-                    Some(MimeType::Type(self.mime_table[id as usize].clone()))
-                } else {
-                    println!("WARNING unknown mimetype idx {}", id);
-                    None
-                }
+                // The caller turns `None` into `Error::UnknownMimeType`; a library must not write
+                // to the consumer's stdout.
+                self.mime_table
+                    .get(id as usize)
+                    .map(|mime| MimeType::Type(mime.clone()))
             }
         }
     }
