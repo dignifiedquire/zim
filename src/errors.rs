@@ -16,8 +16,6 @@ pub enum Error {
     InvalidVersion(u16),
     #[error("invalid header")]
     InvalidHeader,
-    #[error("invalid namespace")]
-    InvalidNamespace,
     #[error("cluster extension requires major version 6")]
     InvalidClusterExtension,
     #[error("cluster is missing a blob list")]

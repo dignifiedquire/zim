@@ -364,7 +364,8 @@ mod tests {
             &[222, 192, 21, 240, 155, 91, 65, 0, 0, 59]
         );
 
-        assert_eq!(zim.iterate_by_urls().count(), 3111);
+        let entries = zim.iterate_by_urls().collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(entries.len(), 3111);
     }
 
     #[ignore]
@@ -391,7 +392,8 @@ mod tests {
             &[148, 79, 82, 254, 154, 242, 15, 122, 255, 0],
         );
 
-        assert_eq!(zim.iterate_by_urls().count(), 9890);
+        let entries = zim.iterate_by_urls().collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(entries.len(), 9890);
     }
 
     #[test]
@@ -420,7 +422,8 @@ mod tests {
             &[0, 0, 73, 69, 78, 68, 174, 66, 96, 130],
         );
 
-        assert_eq!(zim.iterate_by_urls().count(), 19);
+        let entries = zim.iterate_by_urls().collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(entries.len(), 19);
     }
 
     #[test]
@@ -446,6 +449,7 @@ mod tests {
             &[8, 121, 111, 100, 101, 108, 0, 18, 160, 4],
         );
 
-        assert_eq!(zim.iterate_by_urls().count(), 9061);
+        let entries = zim.iterate_by_urls().collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(entries.len(), 9061);
     }
 }

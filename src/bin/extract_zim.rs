@@ -72,7 +72,24 @@ fn main() {
         cluster_map.insert(i, cluster);
     }
 
-    let entries: Vec<_> = zim_file.iterate_by_urls().collect();
+    let mut entries = Vec::new();
+    let mut unreadable = 0usize;
+    for entry in zim_file.iterate_by_urls() {
+        match entry {
+            Ok(entry) => entries.push(entry),
+            Err(err) => {
+                unreadable += 1;
+                eprintln!("skipping unreadable entry: {}", err);
+            }
+        }
+    }
+    if unreadable > 0 {
+        eprintln!(
+            "warning: {} of {} entries could not be read",
+            unreadable, zim_file.header.article_count
+        );
+    }
+
     pb.set_message("Writing entries to disk");
     entries
         .par_iter()
@@ -253,7 +270,7 @@ fn ignore_exists_err<T: AsRef<str>>(e: std::io::Error, msg: T) {
 
 fn make_path(root: &Path, namespace: Namespace, url: &str, mime_type: &MimeType) -> PathBuf {
     let mut s = String::new();
-    s.push(namespace as u8 as char);
+    s.push(namespace.as_byte() as char);
     let mut path = if url.starts_with('/') {
         // make absolute urls relative to the output folder
         let url = url.replacen('/', "", 1);
