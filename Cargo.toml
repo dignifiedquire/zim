@@ -40,3 +40,6 @@ path = "src/bin/ipfs_link.rs"
 [[bin]]
 name = "zim-info"
 path = "src/bin/zim_info.rs"
+
+[dev-dependencies]
+testdir = "0.10.0"

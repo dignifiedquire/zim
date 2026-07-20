@@ -759,9 +759,43 @@ fn compute_checksum(store: &Store, checksum_pos: u64) -> Checksum {
 
 #[cfg(test)]
 mod tests {
+    use testdir::testdir;
+
     use crate::cluster::Compression;
 
     use super::*;
+
+    /// Format version 5.0: the old namespace scheme, and LZMA2 clusters.
+    const V50: &str = "withns/small.zim";
+    /// Format version 6.1: the new namespace scheme, still carrying a header title pointer.
+    const V61: &str = "nons/small.zim";
+    /// Format version 6.2, and by far the largest fixture - 20k entries over 18 clusters.
+    const V62: &str = "nons/wikipedia_en_climate_change_mini_2024-06.zim";
+    /// Format version 6.3: no header title pointer, and no v0 listing.
+    const V63: &str = "noTitleListingV0/small.zim";
+    /// Format version 6.3, with several clusters and non-ASCII paths.
+    const V63_BOOKS: &str = "noTitleListingV0/wikibooks_be_all_nopic_2017-02.zim";
+
+    /// Root of the openZIM testing suite, vendored as a submodule pinned to a release tag.
+    const FIXTURES: &str = "fixtures/data";
+
+    /// Path to a fixture.
+    ///
+    /// Say plainly that the submodule has not been checked out, rather than surfacing a bare
+    /// "no such file" from deep in the parser.
+    fn fixture(name: &str) -> PathBuf {
+        let path = Path::new(FIXTURES).join(name);
+        assert!(
+            path.exists(),
+            "missing fixture {name} - run `git submodule update --init`"
+        );
+
+        path
+    }
+
+    fn open(name: &str) -> Zim {
+        Zim::new(fixture(name)).expect("failed to parse fixture")
+    }
 
     /// Copies a blob out, for comparing against expected bytes.
     fn blob(zim: &Zim, cluster: u32, idx: u32) -> Vec<u8> {
@@ -771,81 +805,7 @@ mod tests {
         guard.blob(idx).unwrap().to_vec()
     }
 
-    #[ignore]
-    #[test]
-    fn test_zim_ab_all_2017_03() {
-        let zim =
-            Zim::new("fixtures/wikipedia_ab_all_2017-03.zim").expect("failed to parse fixture");
-
-        assert_eq!(zim.header.version_major, 5);
-        assert_eq!(blob(&zim, 0, 0), &[97, 98, 107][..]);
-
-        let b = blob(&zim, zim.header.cluster_count - 1, 0);
-        assert_eq!(&b[0..10], &[71, 73, 70, 56, 57, 97, 44, 1, 150, 0]);
-        assert_eq!(
-            &b[b.len() - 10..],
-            &[222, 192, 21, 240, 155, 91, 65, 0, 0, 59]
-        );
-
-        let entries = zim.iterate_by_urls().collect::<Result<Vec<_>>>().unwrap();
-        assert_eq!(entries.len(), 3111);
-    }
-
-    #[ignore]
-    #[test]
-    fn test_zim_ab_all_maxi_2022_05() {
-        let zim = Zim::new("fixtures/wikipedia_ab_all_maxi_2022-05.zim")
-            .expect("failed to parse fixture");
-
-        assert_eq!(zim.header.version_major, 5);
-        assert_eq!(zim.header.article_count, 9890);
-
-        assert_eq!(
-            blob(&zim, 0, 0),
-            &[50, 48, 50, 50, 45, 48, 53, 45, 49, 52][..]
-        );
-        assert_eq!(zim.get_cluster(0).unwrap().compression(), Compression::Zstd);
-
-        let b = blob(&zim, zim.header.cluster_count - 1, 0);
-        assert_eq!(&b[0..10], &[15, 13, 88, 97, 112, 105, 97, 110, 32, 71]);
-        assert_eq!(
-            &b[b.len() - 10..],
-            &[148, 79, 82, 254, 154, 242, 15, 122, 255, 0],
-        );
-
-        let entries = zim.iterate_by_urls().collect::<Result<Vec<_>>>().unwrap();
-        assert_eq!(entries.len(), 9890);
-    }
-
-    #[test]
-    fn test_zim_speedtest_en_mini_2025() {
-        let zim = Zim::new("fixtures/speedtest_en_blob-mini_2024-05.zim")
-            .expect("failed to parse fixture");
-
-        assert_eq!(zim.header.version_major, 6);
-        assert_eq!(zim.header.article_count, 19);
-
-        assert_eq!(
-            blob(&zim, 0, 0),
-            &[
-                115, 112, 101, 101, 100, 116, 101, 115, 116, 95, 101, 110, 95, 98, 108, 111, 98,
-                45, 109, 105, 110, 105
-            ][..]
-        );
-        assert_eq!(zim.get_cluster(0).unwrap().compression(), Compression::Zstd);
-
-        let b = blob(&zim, zim.header.cluster_count - 1, 0);
-        assert_eq!(&b[0..10], &[137, 80, 78, 71, 13, 10, 26, 10, 0, 0]);
-        assert_eq!(
-            &b[b.len() - 10..],
-            &[0, 0, 73, 69, 78, 68, 174, 66, 96, 130],
-        );
-
-        let entries = zim.iterate_by_urls().collect::<Result<Vec<_>>>().unwrap();
-        assert_eq!(entries.len(), 19);
-    }
-
-    /// Everything an archive exposes, for comparing two ways of opening the same bytes.
+    /// Every entry an archive exposes, for comparing two ways of opening the same bytes.
     fn snapshot(zim: &Zim) -> Vec<(String, String, String, Option<Vec<u8>>)> {
         zim.iterate_by_urls()
             .map(|entry| {
@@ -865,411 +825,160 @@ mod tests {
             .collect()
     }
 
-    /// Writes `raw` out as chunk files named `archive.zimaa`, `archive.zimab`, ... in `dir`, and
-    /// returns the path of the archive as a whole - which deliberately does not exist.
-    fn write_chunks(dir: &std::path::Path, raw: &[u8], chunk_size: usize) -> PathBuf {
-        std::fs::create_dir_all(dir).expect("failed to create chunk dir");
-
-        for (idx, chunk) in raw.chunks(chunk_size).enumerate() {
-            let suffix = format!(
-                "{}{}",
-                (b'a' + (idx / 26) as u8) as char,
-                (b'a' + (idx % 26) as u8) as char
-            );
-            std::fs::write(dir.join(format!("archive.zim{suffix}")), chunk)
-                .expect("failed to write chunk");
-        }
-
-        dir.join("archive.zim")
-    }
-
-    /// A split archive is the concatenation of its chunks, so it must read exactly like the
-    /// whole file - including for structures that straddle a chunk boundary and therefore have
-    /// no contiguous backing to borrow from.
+    /// The headline check: each supported format version opens and reports itself correctly.
     #[test]
-    fn reads_a_split_archive_identically_to_the_whole_file() {
-        let source = "fixtures/speedtest_en_blob-mini_2024-05.zim";
+    fn reads_every_supported_format_version() {
+        // name, version, entries, clusters, main page path
+        let cases = [
+            (V50, (5, 0), 17, 2, "main.html"),
+            (V61, (6, 1), 16, 2, "main.html"),
+            (V62, (6, 2), 20568, 18, "index"),
+            (V63, (6, 3), 16, 2, "main.html"),
+            (V63_BOOKS, (6, 3), 123, 2, "Першая_старонка.html"),
+        ];
 
-        let single = Zim::new(source).expect("failed to parse fixture");
-        single
-            .verify_checksum()
-            .expect("fixture checksum must match");
-        let expected = snapshot(&single);
+        for (name, version, entries, clusters, main_page) in cases {
+            let zim = open(name);
 
-        let raw = std::fs::read(source).expect("failed to read fixture");
-
-        // Boundaries chosen to land in the directory entries, the clusters, the pointer lists,
-        // and inside the trailing checksum respectively. The 26x26 naming scheme caps the chunk
-        // count at 676, so none of these may be too small.
-        for chunk_size in [10_000, 300_000, raw.len() / 2, 2_064_000, raw.len() - 1] {
-            let dir = std::env::temp_dir().join(format!("zim-split-{chunk_size}"));
-            let _ = std::fs::remove_dir_all(&dir);
-
-            let base = write_chunks(&dir, &raw, chunk_size);
-            assert!(!base.exists(), "the archive itself must not exist");
-
-            let split = Zim::new(&base).expect("failed to open split archive");
             assert_eq!(
-                split.store.len(),
-                raw.len() as u64,
-                "chunk size {chunk_size}"
+                (zim.header.version_major, zim.header.version_minor),
+                version,
+                "{name}"
             );
-            assert_eq!(
-                split.header.article_count, single.header.article_count,
-                "chunk size {chunk_size}"
-            );
+            assert_eq!(zim.header.article_count, entries, "{name}");
+            assert_eq!(zim.header.cluster_count, clusters, "{name}");
 
-            let actual = snapshot(&split);
-            assert_eq!(actual.len(), expected.len(), "chunk size {chunk_size}");
-            for (idx, (got, want)) in actual.iter().zip(expected.iter()).enumerate() {
-                assert_eq!(got, want, "chunk size {chunk_size}, entry {idx}");
-            }
-
-            // The checksum covers the archive as a whole, not any single chunk.
-            split
-                .verify_checksum()
-                .unwrap_or_else(|e| panic!("chunk size {chunk_size}: checksum: {e}"));
-
-            // Naming the first chunk must resolve to the same archive.
-            let via_first_chunk =
-                Zim::new(dir.join("archive.zimaa")).expect("failed to open via first chunk");
-            assert_eq!(via_first_chunk.store.len(), raw.len() as u64);
-
-            std::fs::remove_dir_all(&dir).ok();
-        }
-    }
-
-    /// A whole archive takes precedence over chunks sharing its name, and a chunk sequence stops
-    /// at the first gap rather than skipping over it.
-    #[test]
-    fn chunk_discovery_prefers_the_whole_archive_and_stops_at_a_gap() {
-        let raw = std::fs::read("fixtures/speedtest_en_blob-mini_2024-05.zim")
-            .expect("failed to read fixture");
-
-        let dir = std::env::temp_dir().join("zim-split-discovery");
-        let _ = std::fs::remove_dir_all(&dir);
-
-        let base = write_chunks(&dir, &raw, raw.len() / 3);
-
-        // Dropping the second chunk truncates the archive, which must fail the header's
-        // "checksum sits 16 bytes before the end" invariant rather than read short.
-        std::fs::remove_file(dir.join("archive.zimab")).unwrap();
-        assert!(Zim::new(&base).is_err(), "a gap must not be skipped over");
-
-        // With the whole archive present under the same name, the chunks are ignored.
-        std::fs::write(&base, &raw).unwrap();
-        let whole = Zim::new(&base).expect("failed to open whole archive");
-        assert_eq!(whole.store.len(), raw.len() as u64);
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn resolves_the_main_page_through_its_redirect() {
-        // The header's main page index points at `W/mainPage`, which is a redirect into `C`.
-        // Reporting that stub instead of following it yields the useless path "mainPage".
-        for (fixture, expected) in [
-            ("fixtures/speedtest_en_blob-mini_2024-05.zim", "home.html"),
-            ("fixtures/wikipedia_en_100_2026-04.zim", "index"),
-        ] {
-            let zim = Zim::new(fixture).expect("failed to parse fixture");
             let main = zim
                 .main_page()
                 .unwrap()
-                .expect("fixture should have a main page");
+                .unwrap_or_else(|| panic!("{name} should have a main page"));
+            assert_eq!(main.url, main_page, "{name}");
 
-            assert_eq!(main.url, expected, "{fixture}");
-            assert_eq!(main.namespace, Namespace::UserContent, "{fixture}");
+            // Every entry must parse, and the archive must match its own checksum.
+            let parsed = zim
+                .iterate_by_urls()
+                .collect::<Result<Vec<_>>>()
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(parsed.len(), entries as usize, "{name}");
+
+            zim.verify_checksum()
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
         }
     }
 
+    /// Version 5 archives spread content over the old namespace scheme, and the main page is
+    /// reachable only through the header - there is no `W/mainPage` well known entry.
     #[test]
-    fn reads_metadata() {
-        let zim =
-            Zim::new("fixtures/wikipedia_en_100_2026-04.zim").expect("failed to parse fixture");
+    fn reads_the_old_namespace_scheme() {
+        let zim = open(V50);
 
-        let title = zim
-            .metadata("Title")
-            .unwrap()
-            .expect("Title is mandatory")
-            .to_vec()
-            .unwrap();
-        assert_eq!(String::from_utf8(title).unwrap(), "Wikipedia 100");
-
-        assert!(zim.metadata("NoSuchMetadataEntry").unwrap().is_none());
-
-        let keys = zim.metadata_keys().unwrap();
-        for expected in [
-            "Title",
-            "Language",
-            "Creator",
-            "Date",
-            "Illustration_48x48@1",
-        ] {
-            assert!(keys.contains(&expected.to_string()), "missing {expected}");
-        }
-        // Namespace scanning must stop at the namespace boundary rather than run to the end.
-        assert!(keys.len() < zim.header.article_count as usize);
-    }
-
-    #[test]
-    fn exposes_xapian_indexes() {
-        let zim =
-            Zim::new("fixtures/wikipedia_en_100_2026-04.zim").expect("failed to parse fixture");
-
-        // Sizes are read through the handle rather than by loading the index: on a full archive
-        // the fulltext index runs to gigabytes.
-        let fulltext = zim.fulltext_index().unwrap().expect("fulltext index");
-        assert_eq!(fulltext.len().unwrap(), 2_424_832);
-
-        let title = zim.title_index().unwrap().expect("title index");
-        assert_eq!(title.len().unwrap(), 917_504);
-    }
-
-    /// The spec says `titlePtrPos` points directly at the `v0` listing entry's data, so the
-    /// header fallback must produce exactly what the entry does.
-    #[test]
-    fn title_pointer_fallback_matches_the_v0_listing() {
-        let zim = Zim::new("fixtures/speedtest_en_blob-mini_2024-05.zim")
-            .expect("failed to parse fixture");
-
-        let via_entry = zim
-            .entry_list_by_title()
-            .unwrap()
-            .expect("6.2 archives carry the v0 listing")
-            .to_vec()
-            .unwrap();
-        assert_eq!(via_entry.len(), zim.header.article_count as usize);
-
-        let header_listing = Listing {
-            source: Source::Region {
-                store: &zim.store,
-                pos: zim
-                    .header
-                    .title_ptr_pos
-                    .expect("6.2 archives carry titlePtrPos"),
-                count: zim.header.article_count,
-            },
-        };
-        assert_eq!(header_listing.to_vec().unwrap(), via_entry);
-
-        // Random access must agree with the sequential walk, and stop at the end.
-        for (pos, expected) in via_entry.iter().enumerate() {
-            assert_eq!(header_listing.get(pos).unwrap(), Some(*expected));
-        }
-        assert_eq!(header_listing.get(via_entry.len()).unwrap(), None);
-    }
-
-    /// A pointer list is walked in bounded batches so that a listing straddling a chunk boundary
-    /// does not have to be copied whole. The batch seams must not drop or duplicate indices.
-    #[test]
-    fn region_listing_walks_batch_boundaries_correctly() {
-        let zim =
-            Zim::new("fixtures/wikipedia_en_100_2026-04.zim").expect("failed to parse fixture");
-
-        // Any region of the archive decodes as a list of u32; the values are meaningless here,
-        // the point is that the walk spans several batches.
-        let count = LISTING_BATCH * 2 + 7;
-        let pos = 4096u64;
-
-        let listing = Listing {
-            source: Source::Region {
-                store: &zim.store,
-                pos,
-                count,
-            },
-        };
-
-        let raw = zim.store.slice(pos, u64::from(count) * 4).unwrap();
-        let expected: Vec<u32> = raw
-            .chunks_exact(4)
-            .map(|raw| u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
+        let mut seen: Vec<char> = zim
+            .iterate_by_urls()
+            .map(|e| e.unwrap().namespace.as_byte() as char)
             .collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen, ['-', 'A', 'I', 'M', 'X']);
 
-        assert_eq!(listing.len().unwrap(), count as usize);
-        assert_eq!(listing.to_vec().unwrap(), expected);
-        assert_eq!(
-            listing.get(LISTING_BATCH as usize).unwrap(),
-            Some(expected[LISTING_BATCH as usize])
+        assert!(
+            zim.find_by_path(Namespace::CategoriesArticle, MAIN_PAGE)
+                .unwrap()
+                .is_none(),
+            "version 5 has no W namespace"
         );
+        let main = zim.main_page().unwrap().expect("main page via the header");
+        assert_eq!(main.namespace, Namespace::Articles);
+        assert_eq!(main.url, "main.html");
     }
 
-    /// Asking a cluster about itself must not pull its data in. Clusters are not small - the
-    /// largest in this fixture is 78MB - so a reader that inspects every cluster, as `zim-info`
-    /// does, would otherwise fault in most of the archive.
+    /// The only fixture using LZMA2 rather than zstd, so the only cover for that decoder.
     #[test]
-    fn cluster_data_loads_only_on_blob_access() {
-        let zim =
-            Zim::new("fixtures/wikipedia_en_100_2026-04.zim").expect("failed to parse fixture");
+    fn decompresses_lzma2_clusters() {
+        let zim = open(V50);
 
-        for idx in 0..zim.header.cluster_count {
-            let cluster = zim.get_cluster(idx).unwrap();
-            let _ = cluster.compression();
-            assert!(
-                !cluster.is_loaded(),
-                "cluster {idx} was loaded just to report its compression"
-            );
-        }
+        assert_eq!(
+            zim.get_cluster(0).unwrap().compression(),
+            Compression::Lzma2
+        );
 
         let cluster = zim.get_cluster(0).unwrap();
         let guard = cluster.read().unwrap();
-        assert!(guard.blob_count() > 0);
-        assert!(cluster.is_loaded(), "reading a blob must load the cluster");
+        assert_eq!(guard.blob_count(), 13);
+        assert_eq!(guard.blob(0).unwrap(), b"=en");
+
+        // The second cluster is a stored PNG, so it exercises the uncompressed path alongside.
+        assert_eq!(zim.get_cluster(1).unwrap().compression(), Compression::None);
+        let png = blob(&zim, 1, 0);
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
     }
 
-    /// Content from an uncompressed cluster must be borrowed straight from the mapping rather
-    /// than copied. This is what keeps a multi-gigabyte search index from having to be read into
-    /// memory in order to be used, and the format requires indexes and listings to be stored
-    /// uncompressed precisely so that this is possible.
+    /// Deliberately corrupted archives from the openZIM testing suite.
+    ///
+    /// A reader handed an untrusted file must reject it, not abort the process. Every one of
+    /// these is exercised end to end - opened, walked, and every blob read - and the test passes
+    /// only by reaching the end without panicking.
     #[test]
-    fn index_content_is_borrowed_from_the_mapping() {
-        let zim =
-            Zim::new("fixtures/wikipedia_en_100_2026-04.zim").expect("failed to parse fixture");
-
-        for content in [
-            zim.fulltext_index().unwrap().expect("fulltext index"),
-            zim.title_index().unwrap().expect("title index"),
-        ] {
-            let borrowed = content
-                .with(|bytes| {
-                    let start = bytes.as_ptr() as usize;
-
-                    zim.store
-                        .prefix_chunks(zim.store.len())
-                        .iter()
-                        .any(|chunk| {
-                            let low = chunk.as_ptr() as usize;
-                            start >= low && start < low + chunk.len()
-                        })
-                })
-                .unwrap();
-
-            assert!(borrowed, "content must point into the mapping, not a copy");
-        }
-    }
-
-    /// Version 6.3 removed both the header's title pointer list and the `v0` listing, leaving
-    /// only the article listing. Title ordering must still be reachable for such archives.
-    #[test]
-    fn title_listings_track_the_format_version() {
-        let v62 = Zim::new("fixtures/speedtest_en_blob-mini_2024-05.zim")
-            .expect("failed to parse fixture");
-        assert_eq!((v62.header.version_major, v62.header.version_minor), (6, 2));
-        assert!(v62.header.title_ptr_pos.is_some());
-        assert!(v62.entry_list_by_title().unwrap().is_some());
-        assert!(v62.article_list_by_title().unwrap().is_some());
-
-        let v63 =
-            Zim::new("fixtures/wikipedia_en_100_2026-04.zim").expect("failed to parse fixture");
-        assert_eq!((v63.header.version_major, v63.header.version_minor), (6, 3));
-        assert!(v63.header.title_ptr_pos.is_none());
-        assert!(v63.entry_list_by_title().unwrap().is_none());
-
-        let articles = v63
-            .article_list_by_title()
-            .unwrap()
-            .expect("6.3 archives carry the v1 listing");
-        assert!(!articles.is_empty().unwrap());
-        assert!(articles.len().unwrap() < v63.header.article_count as usize);
-
-        // The listing must decode to real indices, in title order - a wrong element width or
-        // endianness would still produce a plausible-looking list of numbers.
-        let mut titles: Vec<String> = Vec::new();
-        articles
-            .for_each(|idx| {
-                let entry = v63
-                    .get_by_url_index(idx)
-                    .expect("listing index must be valid");
-                titles.push(if entry.title.is_empty() {
-                    entry.url
-                } else {
-                    entry.title
-                });
+    fn corrupt_archives_are_rejected_without_panicking() {
+        let dir = Path::new(FIXTURES).join("nons");
+        let mut corrupt: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .expect("missing fixtures - run `git submodule update --init`")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("invalid."))
             })
-            .unwrap();
+            .collect();
+        corrupt.sort();
+
         assert!(
-            titles.windows(2).all(|pair| pair[0] <= pair[1]),
-            "v1 listing is not in title order"
+            corrupt.len() >= 20,
+            "expected the corrupt fixture set, found {}",
+            corrupt.len()
         );
-    }
 
-    /// `find_by_path` is a binary search, which is only sound because the format guarantees that
-    /// directory entries are stored ordered by namespace byte then path.
-    #[test]
-    fn entries_are_ordered_by_namespace_and_path() {
-        for fixture in [
-            "fixtures/speedtest_en_blob-mini_2024-05.zim",
-            "fixtures/wikipedia_en_100_2026-04.zim",
-        ] {
-            let zim = Zim::new(fixture).expect("failed to parse fixture");
-            let entries = zim
-                .iterate_by_urls()
-                .collect::<Result<Vec<_>>>()
-                .expect("failed to read entries");
+        let mut rejected_at_open = 0usize;
+        for path in &corrupt {
+            let Ok(zim) = Zim::new(path) else {
+                rejected_at_open += 1;
+                continue;
+            };
 
-            for pair in entries.windows(2) {
-                let before = (pair[0].namespace.as_byte(), pair[0].url.as_str());
-                let after = (pair[1].namespace.as_byte(), pair[1].url.as_str());
-                assert!(
-                    before < after,
-                    "{fixture}: {before:?} must precede {after:?}"
-                );
+            for entry in zim.iterate_by_urls() {
+                let Ok(entry) = entry else { continue };
+                if let Ok(Some(content)) = zim.entry_content(&entry) {
+                    let _ = content.to_vec();
+                }
             }
-        }
-    }
 
-    #[test]
-    fn find_by_path_locates_well_known_entries() {
-        let zim =
-            Zim::new("fixtures/wikipedia_en_100_2026-04.zim").expect("failed to parse fixture");
+            for idx in 0..zim.header.cluster_count {
+                let Ok(cluster) = zim.get_cluster(idx) else {
+                    continue;
+                };
+                let Ok(guard) = cluster.read() else { continue };
+                for blob in 0..guard.blob_count() as u32 + 1 {
+                    let _ = guard.blob(blob);
+                }
+            }
 
-        // The entries a reader needs in order to resolve anything in a 6.1+ archive.
-        for (namespace, path) in [
-            (Namespace::CategoriesArticle, "mainPage"),
-            (Namespace::FulltextIndex, "listing/titleOrdered/v1"),
-            (Namespace::FulltextIndex, "fulltext/xapian"),
-            (Namespace::FulltextIndex, "title/xapian"),
-            (Namespace::Metadata, "Title"),
-            (Namespace::Metadata, "Illustration_48x48@1"),
-        ] {
-            let found = zim.find_by_path(namespace, path).unwrap();
-            assert!(found.is_some(), "{namespace:?}/{path} should be found");
+            let _ = zim.main_page();
+            let _ = zim.metadata_keys();
+            let _ = zim.entry_list_by_title().map(|l| l.map(|l| l.to_vec()));
+            let _ = zim.article_list_by_title().map(|l| l.map(|l| l.to_vec()));
+            let _ = zim.fulltext_index();
 
-            let entry = zim.get_by_path(namespace, path).unwrap().unwrap();
-            assert_eq!(entry.url, path);
-            assert_eq!(entry.namespace, namespace);
-        }
-
-        assert_eq!(
-            zim.find_by_path(Namespace::UserContent, "definitely/not/here")
-                .unwrap(),
-            None
-        );
-        // Present as a path, but only under a different namespace.
-        assert_eq!(
-            zim.find_by_path(Namespace::UserContent, "mainPage")
-                .unwrap(),
-            None
-        );
-    }
-
-    /// Every entry must be findable at exactly its own index, which catches comparator mistakes
-    /// that spot checks on a handful of paths would miss.
-    #[test]
-    fn find_by_path_agrees_with_iteration() {
-        let zim = Zim::new("fixtures/speedtest_en_blob-mini_2024-05.zim")
-            .expect("failed to parse fixture");
-
-        for (idx, entry) in zim.iterate_by_urls().enumerate() {
-            let entry = entry.expect("failed to read entry");
-            assert_eq!(
-                zim.find_by_path(entry.namespace, &entry.url).unwrap(),
-                Some(idx as u32),
-                "{:?}/{}",
-                entry.namespace,
-                entry.url
+            // None of these files is intact, so none may pass the checksum.
+            assert!(
+                zim.verify_checksum().is_err(),
+                "{} passed its checksum",
+                path.display()
             );
         }
+
+        assert!(
+            rejected_at_open >= 5,
+            "expected the header checks to reject several archives outright, got {rejected_at_open}"
+        );
     }
 
     /// Contradictory header offsets must be caught when the archive is opened. Otherwise they
@@ -1277,8 +986,7 @@ mod tests {
     /// last cluster, whose extent is derived from `checksumPos` - as silently wrong data.
     #[test]
     fn corrupt_headers_are_rejected_on_open() {
-        let original = std::fs::read("fixtures/speedtest_en_blob-mini_2024-05.zim")
-            .expect("failed to read fixture");
+        let original = std::fs::read(fixture(V63)).expect("failed to read fixture");
         let file_len = original.len() as u64;
 
         let cases: [(usize, Vec<u8>, &str); 6] = [
@@ -1316,17 +1024,16 @@ mod tests {
             ),
         ];
 
+        let dir: PathBuf = testdir!();
+
         for (offset, value, what) in cases {
             let mut corrupt = original.clone();
             corrupt[offset..offset + value.len()].copy_from_slice(&value);
 
-            let path = std::env::temp_dir().join(format!("zim-corrupt-header-{offset}.zim"));
-            std::fs::write(&path, &corrupt).expect("failed to write temp archive");
+            let path = dir.join(format!("corrupt-{offset}.zim"));
+            std::fs::write(&path, &corrupt).expect("failed to write test archive");
 
-            let result = Zim::new(&path);
-            std::fs::remove_file(&path).ok();
-
-            match result {
+            match Zim::new(&path) {
                 Err(Error::InvalidHeader(_)) => {}
                 Err(other) => panic!("{what}: expected InvalidHeader, got {other:?}"),
                 Ok(_) => panic!("{what}: expected the archive to be rejected"),
@@ -1339,8 +1046,7 @@ mod tests {
     /// rather than abort the calling process.
     #[test]
     fn out_of_range_accessors_error_instead_of_panicking() {
-        let zim = Zim::new("fixtures/speedtest_en_blob-mini_2024-05.zim")
-            .expect("failed to parse fixture");
+        let zim = open(V63);
 
         assert!(zim.get_by_url_index(zim.header.article_count).is_err());
         assert!(zim.get_by_url_index(u32::MAX).is_err());
@@ -1360,28 +1066,414 @@ mod tests {
         assert!(guard.blob(count).is_err(), "the end sentinel is not a blob");
     }
 
+    /// `find_by_path` is a binary search, which is only sound because the format guarantees that
+    /// directory entries are stored ordered by namespace byte then path.
     #[test]
-    fn test_zim_wikipedia_en_100_2026_04() {
-        let zim =
-            Zim::new("fixtures/wikipedia_en_100_2026-04.zim").expect("failed to parse fixture");
+    fn entries_are_ordered_by_namespace_and_path() {
+        for name in [V50, V61, V62, V63, V63_BOOKS] {
+            let zim = open(name);
+            let entries = zim
+                .iterate_by_urls()
+                .collect::<Result<Vec<_>>>()
+                .expect("failed to read entries");
 
-        assert_eq!(zim.header.version_major, 6);
-        assert_eq!(zim.header.article_count, 9061);
+            for pair in entries.windows(2) {
+                let before = (pair[0].namespace.as_byte(), pair[0].url.as_str());
+                let after = (pair[1].namespace.as_byte(), pair[1].url.as_str());
+                assert!(before < after, "{name}: {before:?} must precede {after:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn find_by_path_locates_well_known_entries() {
+        let zim = open(V62);
+
+        // The entries a reader needs in order to resolve anything in a 6.1+ archive.
+        for (namespace, path) in [
+            (Namespace::CategoriesArticle, MAIN_PAGE),
+            (Namespace::FulltextIndex, LISTING_TITLE_ORDERED_V0),
+            (Namespace::FulltextIndex, LISTING_TITLE_ORDERED_V1),
+            (Namespace::FulltextIndex, XAPIAN_FULLTEXT),
+            (Namespace::FulltextIndex, XAPIAN_TITLE),
+            (Namespace::Metadata, "Title"),
+            (Namespace::Metadata, "Illustration_48x48@1"),
+        ] {
+            let found = zim.find_by_path(namespace, path).unwrap();
+            assert!(found.is_some(), "{namespace:?}/{path} should be found");
+
+            let entry = zim.get_by_path(namespace, path).unwrap().unwrap();
+            assert_eq!(entry.url, path);
+            assert_eq!(entry.namespace, namespace);
+        }
 
         assert_eq!(
-            blob(&zim, 0, 0),
-            &[87, 105, 107, 105, 112, 101, 100, 105, 97][..]
+            zim.find_by_path(Namespace::UserContent, "definitely/not/here")
+                .unwrap(),
+            None
         );
-        assert_eq!(zim.get_cluster(0).unwrap().compression(), Compression::Zstd);
-
-        let b = blob(&zim, zim.header.cluster_count - 1, 0);
-        assert_eq!(&b[0..10], &[15, 13, 88, 97, 112, 105, 97, 110, 32, 71]);
+        // Present as a path, but only under a different namespace.
         assert_eq!(
-            &b[b.len() - 10..],
-            &[8, 121, 111, 100, 101, 108, 0, 18, 160, 4],
+            zim.find_by_path(Namespace::UserContent, MAIN_PAGE).unwrap(),
+            None
+        );
+    }
+
+    /// Every entry must be findable at exactly its own index, which catches comparator mistakes
+    /// that spot checks on a handful of paths would miss.
+    #[test]
+    fn find_by_path_agrees_with_iteration() {
+        for name in [V50, V63, V63_BOOKS] {
+            let zim = open(name);
+
+            for (idx, entry) in zim.iterate_by_urls().enumerate() {
+                let entry = entry.expect("failed to read entry");
+                assert_eq!(
+                    zim.find_by_path(entry.namespace, &entry.url).unwrap(),
+                    Some(idx as u32),
+                    "{name}: {:?}/{}",
+                    entry.namespace,
+                    entry.url
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn namespace_range_covers_exactly_one_namespace() {
+        let zim = open(V62);
+
+        let range = zim.namespace_range(Namespace::Metadata).unwrap();
+        assert!(!range.is_empty());
+
+        for idx in range.clone() {
+            assert_eq!(
+                zim.get_by_url_index(idx).unwrap().namespace,
+                Namespace::Metadata
+            );
+        }
+
+        // The neighbours must fall outside it.
+        if range.start > 0 {
+            assert_ne!(
+                zim.get_by_url_index(range.start - 1).unwrap().namespace,
+                Namespace::Metadata
+            );
+        }
+        assert_ne!(
+            zim.get_by_url_index(range.end).unwrap().namespace,
+            Namespace::Metadata
+        );
+    }
+
+    #[test]
+    fn reads_metadata() {
+        let zim = open(V62);
+
+        let title = zim
+            .metadata("Title")
+            .unwrap()
+            .expect("Title is mandatory")
+            .to_vec()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(title).unwrap(),
+            "Climate change by Wikipedia"
         );
 
-        let entries = zim.iterate_by_urls().collect::<Result<Vec<_>>>().unwrap();
-        assert_eq!(entries.len(), 9061);
+        assert!(zim.metadata("NoSuchMetadataEntry").unwrap().is_none());
+
+        let keys = zim.metadata_keys().unwrap();
+        for expected in [
+            "Title",
+            "Language",
+            "Creator",
+            "Date",
+            "Illustration_48x48@1",
+        ] {
+            assert!(keys.contains(&expected.to_string()), "missing {expected}");
+        }
+        // Namespace scanning must stop at the namespace boundary rather than run to the end.
+        assert!(keys.len() < zim.header.article_count as usize);
+    }
+
+    #[test]
+    fn exposes_xapian_indexes() {
+        let zim = open(V62);
+
+        // Sizes are read through the handle rather than by loading the index: on a full archive
+        // the fulltext index runs to gigabytes.
+        let fulltext = zim.fulltext_index().unwrap().expect("fulltext index");
+        assert_eq!(fulltext.len().unwrap(), 1_646_592);
+
+        let title = zim.title_index().unwrap().expect("title index");
+        assert_eq!(title.len().unwrap(), 827_392);
+
+        // Absent indexes are reported as such rather than erroring.
+        assert!(open(V63).fulltext_index().unwrap().is_none());
+    }
+
+    /// Asking a cluster about itself must not pull its data in. Clusters are not small, so a
+    /// reader that inspects every cluster, as `zim-info` does, would otherwise fault in most of
+    /// the archive.
+    #[test]
+    fn cluster_data_loads_only_on_blob_access() {
+        let zim = open(V62);
+
+        for idx in 0..zim.header.cluster_count {
+            let cluster = zim.get_cluster(idx).unwrap();
+            let _ = cluster.compression();
+            assert!(
+                !cluster.is_loaded(),
+                "cluster {idx} was loaded just to report its compression"
+            );
+        }
+
+        let cluster = zim.get_cluster(0).unwrap();
+        let guard = cluster.read().unwrap();
+        assert!(guard.blob_count() > 0);
+        assert!(cluster.is_loaded(), "reading a blob must load the cluster");
+    }
+
+    /// Content from an uncompressed cluster must be borrowed straight from the mapping rather
+    /// than copied. This is what keeps a multi-gigabyte search index from having to be read into
+    /// memory in order to be used, and the format requires indexes and listings to be stored
+    /// uncompressed precisely so that this is possible.
+    #[test]
+    fn index_content_is_borrowed_from_the_mapping() {
+        let zim = open(V62);
+
+        for content in [
+            zim.fulltext_index().unwrap().expect("fulltext index"),
+            zim.title_index().unwrap().expect("title index"),
+        ] {
+            let borrowed = content
+                .with(|bytes| {
+                    let start = bytes.as_ptr() as usize;
+
+                    zim.store
+                        .prefix_chunks(zim.store.len())
+                        .iter()
+                        .any(|chunk| {
+                            let low = chunk.as_ptr() as usize;
+                            start >= low && start < low + chunk.len()
+                        })
+                })
+                .unwrap();
+
+            assert!(borrowed, "content must point into the mapping, not a copy");
+        }
+    }
+
+    /// Version 6.3 removed both the header's title pointer list and the `v0` listing, leaving
+    /// only the article listing. Title ordering must still be reachable for such archives.
+    #[test]
+    fn title_listings_track_the_format_version() {
+        for name in [V50, V61, V62] {
+            let zim = open(name);
+            assert!(
+                zim.header.title_ptr_pos.is_some(),
+                "{name} predates 6.3 and should carry titlePtrPos"
+            );
+            assert!(
+                zim.entry_list_by_title().unwrap().is_some(),
+                "{name} should expose an all-entry title listing"
+            );
+        }
+
+        for name in [V63, V63_BOOKS] {
+            let zim = open(name);
+            assert!(zim.header.title_ptr_pos.is_none(), "{name}");
+            assert!(
+                zim.entry_list_by_title().unwrap().is_none(),
+                "{name} dropped both the v0 listing and titlePtrPos"
+            );
+
+            let articles = zim
+                .article_list_by_title()
+                .unwrap()
+                .expect("6.3 archives carry the v1 listing");
+            assert!(!articles.is_empty().unwrap(), "{name}");
+            assert!(
+                articles.len().unwrap() <= zim.header.article_count as usize,
+                "{name}"
+            );
+
+            // The listing must decode to real indices, in title order - a wrong element width or
+            // endianness would still produce a plausible-looking list of numbers.
+            let mut titles: Vec<String> = Vec::new();
+            articles
+                .for_each(|idx| {
+                    let entry = zim
+                        .get_by_url_index(idx)
+                        .expect("listing index must be valid");
+                    titles.push(if entry.title.is_empty() {
+                        entry.url
+                    } else {
+                        entry.title
+                    });
+                })
+                .unwrap();
+            assert!(
+                titles.windows(2).all(|pair| pair[0] <= pair[1]),
+                "{name}: v1 listing is not in title order"
+            );
+        }
+    }
+
+    /// The spec says `titlePtrPos` points directly at the `v0` listing entry's data, so the
+    /// header fallback must produce exactly what the entry does.
+    #[test]
+    fn title_pointer_fallback_matches_the_v0_listing() {
+        let zim = open(V61);
+
+        let via_entry = zim
+            .entry_list_by_title()
+            .unwrap()
+            .expect("6.1 archives carry the v0 listing")
+            .to_vec()
+            .unwrap();
+        assert_eq!(via_entry.len(), zim.header.article_count as usize);
+
+        let header_listing = Listing {
+            source: Source::Region {
+                store: &zim.store,
+                pos: zim
+                    .header
+                    .title_ptr_pos
+                    .expect("6.1 archives carry titlePtrPos"),
+                count: zim.header.article_count,
+            },
+        };
+        assert_eq!(header_listing.to_vec().unwrap(), via_entry);
+
+        // Random access must agree with the sequential walk, and stop at the end.
+        for (pos, expected) in via_entry.iter().enumerate() {
+            assert_eq!(header_listing.get(pos).unwrap(), Some(*expected));
+        }
+        assert_eq!(header_listing.get(via_entry.len()).unwrap(), None);
+    }
+
+    /// A pointer list is walked in bounded batches so a listing straddling a chunk boundary does
+    /// not have to be copied whole. The batch seams must not drop or duplicate indices.
+    #[test]
+    fn region_listing_walks_batch_boundaries_correctly() {
+        let zim = open(V62);
+
+        // Any region of the archive decodes as a list of u32; the values are meaningless here,
+        // the point is that the walk spans several batches.
+        let count = LISTING_BATCH * 2 + 7;
+        let pos = 4096u64;
+
+        let listing = Listing {
+            source: Source::Region {
+                store: &zim.store,
+                pos,
+                count,
+            },
+        };
+
+        let raw = zim.store.slice(pos, u64::from(count) * 4).unwrap();
+        let expected: Vec<u32> = raw
+            .chunks_exact(4)
+            .map(|raw| u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
+            .collect();
+
+        assert_eq!(listing.len().unwrap(), count as usize);
+        assert_eq!(listing.to_vec().unwrap(), expected);
+        assert_eq!(
+            listing.get(LISTING_BATCH as usize).unwrap(),
+            Some(expected[LISTING_BATCH as usize])
+        );
+    }
+
+    /// Writes `raw` out as chunk files named `archive.zimaa`, `archive.zimab`, ... in `dir`, and
+    /// returns the path of the archive as a whole - which deliberately does not exist.
+    fn write_chunks(dir: &Path, raw: &[u8], chunk_size: usize) -> PathBuf {
+        std::fs::create_dir_all(dir).expect("failed to create chunk dir");
+
+        for (idx, chunk) in raw.chunks(chunk_size).enumerate() {
+            let suffix = format!(
+                "{}{}",
+                (b'a' + (idx / 26) as u8) as char,
+                (b'a' + (idx % 26) as u8) as char
+            );
+            std::fs::write(dir.join(format!("archive.zim{suffix}")), chunk)
+                .expect("failed to write chunk");
+        }
+
+        dir.join("archive.zim")
+    }
+
+    /// A split archive is the concatenation of its chunks, so it must read exactly like the
+    /// whole file - including for structures that straddle a chunk boundary and therefore have
+    /// no contiguous backing to borrow from.
+    #[test]
+    fn reads_a_split_archive_identically_to_the_whole_file() {
+        let single = open(V63_BOOKS);
+        single
+            .verify_checksum()
+            .expect("fixture checksum must match");
+        let expected = snapshot(&single);
+
+        let raw = std::fs::read(fixture(V63_BOOKS)).expect("failed to read fixture");
+
+        // Boundaries chosen to land in the directory entries, the clusters, the pointer lists,
+        // and inside the trailing checksum respectively. The 26x26 naming scheme caps the chunk
+        // count at 676, so none of these may be too small.
+        let root: PathBuf = testdir!();
+
+        for chunk_size in [1_000, 40_000, raw.len() / 2, raw.len() - 20, raw.len() - 1] {
+            let dir = root.join(format!("split-{chunk_size}"));
+            let base = write_chunks(&dir, &raw, chunk_size);
+            assert!(!base.exists(), "the archive itself must not exist");
+
+            let split = Zim::new(&base).expect("failed to open split archive");
+            assert_eq!(
+                split.store.len(),
+                raw.len() as u64,
+                "chunk size {chunk_size}"
+            );
+            assert_eq!(
+                split.header.article_count, single.header.article_count,
+                "chunk size {chunk_size}"
+            );
+
+            let actual = snapshot(&split);
+            assert_eq!(actual.len(), expected.len(), "chunk size {chunk_size}");
+            for (idx, (got, want)) in actual.iter().zip(expected.iter()).enumerate() {
+                assert_eq!(got, want, "chunk size {chunk_size}, entry {idx}");
+            }
+
+            // The checksum covers the archive as a whole, not any single chunk.
+            split
+                .verify_checksum()
+                .unwrap_or_else(|e| panic!("chunk size {chunk_size}: checksum: {e}"));
+
+            // Naming the first chunk must resolve to the same archive.
+            let via_first_chunk =
+                Zim::new(dir.join("archive.zimaa")).expect("failed to open via first chunk");
+            assert_eq!(via_first_chunk.store.len(), raw.len() as u64);
+        }
+    }
+
+    /// A whole archive takes precedence over chunks sharing its name, and a chunk sequence stops
+    /// at the first gap rather than skipping over it.
+    #[test]
+    fn chunk_discovery_prefers_the_whole_archive_and_stops_at_a_gap() {
+        let raw = std::fs::read(fixture(V63)).expect("failed to read fixture");
+
+        let dir: PathBuf = testdir!();
+        let base = write_chunks(&dir, &raw, raw.len() / 3);
+
+        // Dropping the second chunk truncates the archive, which must fail the header's
+        // "checksum sits 16 bytes before the end" invariant rather than read short.
+        std::fs::remove_file(dir.join("archive.zimab")).unwrap();
+        assert!(Zim::new(&base).is_err(), "a gap must not be skipped over");
+
+        // With the whole archive present under the same name, the chunks are ignored.
+        std::fs::write(&base, &raw).unwrap();
+        let whole = Zim::new(&base).expect("failed to open whole archive");
+        assert_eq!(whole.store.len(), raw.len() as u64);
     }
 }
